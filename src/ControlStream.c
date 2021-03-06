@@ -826,7 +826,7 @@ int sendInputPacketOnControlStream(unsigned char* data, int length) {
 }
 
 // Starts the control stream
-int startControlStream(void) {
+int startControlStream(int port1) {
     int err;
 
     if (AppVersionQuad[0] >= 5) {
@@ -834,7 +834,7 @@ int startControlStream(void) {
         ENetEvent event;
         
         enet_address_set_address(&address, (struct sockaddr *)&RemoteAddr, RemoteAddrLen);
-        enet_address_set_port(&address, 47999);
+        enet_address_set_port(&address, port1+4);
 
         // Create a client that can use 1 outgoing connection and 1 channel
         client = enet_host_create(address.address.ss_family, NULL, 1, 1, 0, 0);
