@@ -6,6 +6,7 @@ static ConnListenerConnectionTerminated originalTerminationCallback;
 static bool alreadyTerminated;
 static PLT_THREAD terminationCallbackThread;
 static int terminationCallbackErrorCode;
+static int port1 = 0;
 
 // Common globals
 char* RemoteAddrString;
@@ -170,8 +171,9 @@ static void ClInternalConnectionTerminated(int errorCode)
 // Starts the connection to the streaming machine
 int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION streamConfig, PCONNECTION_LISTENER_CALLBACKS clCallbacks,
     PDECODER_RENDERER_CALLBACKS drCallbacks, PAUDIO_RENDERER_CALLBACKS arCallbacks, void* renderContext, int drFlags,
-    void* audioContext, int arFlags, int port1) {
+    void* audioContext, int arFlags, int port) {
     int err;
+    port1 = port;
 
     // Replace missing callbacks with placeholders
     fixupMissingCallbacks(&drCallbacks, &arCallbacks, &clCallbacks);
@@ -367,7 +369,7 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
 
     Limelog("Starting audio stream...");
     ListenerCallbacks.stageStarting(STAGE_AUDIO_STREAM_START);
-    err = startAudioStream(audioContext, arFlags);
+    err = startAudioStream(audioContext, arFlags, port1);
     if (err != 0) {
         Limelog("Audio stream start failed: %d\n", err);
         ListenerCallbacks.stageFailed(STAGE_AUDIO_STREAM_START, err);

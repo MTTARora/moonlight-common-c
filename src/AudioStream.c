@@ -17,7 +17,8 @@ static unsigned short lastSeq;
 
 static bool receivedDataFromPeer;
 
-#define RTP_PORT 48000
+static int port1 = 0;
+//#define RTP_PORT 48000
 
 #define MAX_PACKET_SIZE 1400
 
@@ -71,7 +72,7 @@ static void UdpPingThreadProc(void* context) {
     SOCK_RET err;
 
     memcpy(&saddr, &RemoteAddr, sizeof(saddr));
-    saddr.sin6_port = htons(RTP_PORT);
+    saddr.sin6_port = htons(port1+5);
 
     // Send PING every second until we get data back then every 5 seconds after that.
     while (!PltIsThreadInterrupted(&udpPingThread)) {
@@ -296,8 +297,9 @@ void stopAudioStream(void) {
     AudioCallbacks.cleanup();
 }
 
-int startAudioStream(void* audioContext, int arFlags) {
+int startAudioStream(void* audioContext, int arFlags, int port) {
     int err;
+    port1 = port;
     OPUS_MULTISTREAM_CONFIGURATION chosenConfig;
 
     if (HighQualitySurroundEnabled) {
