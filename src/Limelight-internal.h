@@ -73,7 +73,7 @@ void connectionSawFrame(int frameIndex);
 void connectionLostPackets(int lastReceivedPacket, int nextReceivedPacket);
 int sendInputPacketOnControlStream(unsigned char* data, int length);
 
-int performRtspHandshake(void);
+int performRtspHandshake(int port1);
 
 void initializeVideoDepacketizer(int pktSize);
 void destroyVideoDepacketizer(void);
