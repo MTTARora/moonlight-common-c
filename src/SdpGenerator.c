@@ -425,15 +425,15 @@ static int fillSdpHeader(char* buffer, int rtspClientVersion, char*urlSafeAddr) 
 }
 
 // Populate the SDP tail with required information
-static int fillSdpTail(char* buffer) {
+static int fillSdpTail(char* buffer, int port1) {
     return sprintf(buffer,
         "t=0 0\r\n"
         "m=video %d  \r\n",
-        AppVersionQuad[0] < 4 ? 47996 : 47998);
+        AppVersionQuad[0] < 4 ? 47996 : port1+3);
 }
 
 // Get the SDP attributes for the stream config
-char* getSdpPayloadForStreamConfig(int rtspClientVersion, int* length) {
+char* getSdpPayloadForStreamConfig(int rtspClientVersion, int* length, int port1) {
     PSDP_OPTION attributeList;
     int offset;
     char* payload;
@@ -455,7 +455,7 @@ char* getSdpPayloadForStreamConfig(int rtspClientVersion, int* length) {
 
     offset = fillSdpHeader(payload, rtspClientVersion, urlSafeAddr);
     offset += fillSerializedAttributeList(&payload[offset], attributeList);
-    offset += fillSdpTail(&payload[offset]);
+    offset += fillSdpTail(&payload[offset], port1);
 
     freeAttributeList(attributeList);
     *length = offset;

@@ -427,7 +427,7 @@ static bool sendVideoAnnounce(PRTSP_MESSAGE response, int* error, int port1) {
             goto FreeMessage;
         }
 
-        request.payload = getSdpPayloadForStreamConfig(rtspClientVersion, &payloadLength);
+        request.payload = getSdpPayloadForStreamConfig(rtspClientVersion, &payloadLength, port1);
         if (request.payload == NULL) {
             goto FreeMessage;
         }

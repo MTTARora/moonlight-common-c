@@ -60,7 +60,7 @@ void* extendBuffer(void* ptr, size_t newSize);
 void fixupMissingCallbacks(PDECODER_RENDERER_CALLBACKS* drCallbacks, PAUDIO_RENDERER_CALLBACKS* arCallbacks,
     PCONNECTION_LISTENER_CALLBACKS* clCallbacks);
 
-char* getSdpPayloadForStreamConfig(int rtspClientVersion, int* length);
+char* getSdpPayloadForStreamConfig(int rtspClientVersion, int* length, int port1);
 
 int initializeControlStream(void);
 int startControlStream(void);

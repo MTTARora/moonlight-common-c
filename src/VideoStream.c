@@ -6,7 +6,7 @@
 #define FIRST_FRAME_MAX 1500
 #define FIRST_FRAME_TIMEOUT_SEC 10
 
-#define RTP_PORT 47998
+//#define RTP_PORT 47998
 #define FIRST_FRAME_PORT 47996
 
 #define RTP_RECV_BUFFER (512 * 1024)
@@ -46,13 +46,13 @@ void destroyVideoStream(void) {
 }
 
 // UDP Ping proc
-static void UdpPingThreadProc(void* context) {
+static void UdpPingThreadProc(void* context, int port1) {
     char pingData[] = { 0x50, 0x49, 0x4E, 0x47 };
     struct sockaddr_in6 saddr;
     SOCK_RET err;
 
     memcpy(&saddr, &RemoteAddr, sizeof(saddr));
-    saddr.sin6_port = htons(RTP_PORT);
+    saddr.sin6_port = htons(port1+3);
 
     while (!PltIsThreadInterrupted(&udpPingThread)) {
         err = sendto(rtpSocket, pingData, sizeof(pingData), 0, (struct sockaddr*)&saddr, RemoteAddrLen);
