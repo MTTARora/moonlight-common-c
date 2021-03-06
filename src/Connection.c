@@ -170,7 +170,7 @@ static void ClInternalConnectionTerminated(int errorCode)
 // Starts the connection to the streaming machine
 int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION streamConfig, PCONNECTION_LISTENER_CALLBACKS clCallbacks,
     PDECODER_RENDERER_CALLBACKS drCallbacks, PAUDIO_RENDERER_CALLBACKS arCallbacks, void* renderContext, int drFlags,
-    void* audioContext, int arFlags) {
+    void* audioContext, int arFlags, int port1) {
     int err;
 
     // Replace missing callbacks with placeholders
@@ -253,12 +253,12 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
 
     Limelog("Resolving host name...");
     ListenerCallbacks.stageStarting(STAGE_NAME_RESOLUTION);
-    err = resolveHostName(serverInfo->address, AF_UNSPEC, 47984, &RemoteAddr, &RemoteAddrLen);
+    err = resolveHostName(serverInfo->address, AF_UNSPEC, port1, &RemoteAddr, &RemoteAddrLen);
     if (err != 0) {
-        err = resolveHostName(serverInfo->address, AF_UNSPEC, 47989, &RemoteAddr, &RemoteAddrLen);
+        err = resolveHostName(serverInfo->address, AF_UNSPEC, port1 + 1, &RemoteAddr, &RemoteAddrLen);
     }
     if (err != 0) {
-        err = resolveHostName(serverInfo->address, AF_UNSPEC, 48010, &RemoteAddr, &RemoteAddrLen);
+        err = resolveHostName(serverInfo->address, AF_UNSPEC, port1 + 2, &RemoteAddr, &RemoteAddrLen);
     }
     if (err != 0) {
         Limelog("failed: %d\n", err);

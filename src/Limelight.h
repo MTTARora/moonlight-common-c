@@ -436,7 +436,7 @@ void LiInitializeServerInformation(PSERVER_INFORMATION serverInfo);
 //
 int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION streamConfig, PCONNECTION_LISTENER_CALLBACKS clCallbacks,
     PDECODER_RENDERER_CALLBACKS drCallbacks, PAUDIO_RENDERER_CALLBACKS arCallbacks, void* renderContext, int drFlags,
-    void* audioContext, int arFlags);
+    void* audioContext, int arFlags, int port1);
 
 // This function stops streaming. This function is not thread-safe.
 void LiStopConnection(void);
@@ -590,7 +590,7 @@ unsigned short LiGetPortFromPortFlagIndex(int portFlagIndex);
 // Populates the output buffer with a stringified list of the port flags set in the input argument.
 // The second and subsequent entries will be prepended by 'separator' (if provided).
 // If the output buffer is too small, the output will be truncated to fit the provided buffer.
-void LiStringifyPortFlags(unsigned int portFlags, const char* separator, char* outputBuffer, int outputBufferLength);
+void LiStringifyPortFlags(unsigned int portFlags, const char* separator, char* outputBuffer, int outputBufferLength, int port1);
 
 // This function may be used to test if the local network is blocking Moonlight's ports. It requires
 // a test server running on an Internet-reachable host. To perform a test, pass in the DNS hostname
@@ -604,7 +604,7 @@ void LiStringifyPortFlags(unsigned int portFlags, const char* separator, char* o
 //
 // The test server is available at https://github.com/cgutman/gfe-loopback
 #define ML_TEST_RESULT_INCONCLUSIVE 0xFFFFFFFF
-unsigned int LiTestClientConnectivity(const char* testServer, unsigned short referencePort, unsigned int testPortFlags);
+unsigned int LiTestClientConnectivity(const char* testServer, unsigned short referencePort, unsigned int testPortFlags, int port1);
 
 #ifdef __cplusplus
 }
