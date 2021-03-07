@@ -87,9 +87,9 @@ int startVideoStream(void* rendererContext, int drFlags);
 void submitFrame(PQUEUED_DECODE_UNIT qdu);
 void stopVideoStream(void);
 
-void initializeAudioStream(void);
+void initializeAudioStream(int port1);
 void destroyAudioStream(void);
-int startAudioStream(void* audioContext, int arFlags, int port1);
+int startAudioStream(void* audioContext, int arFlags);
 void stopAudioStream(void);
 
 int initializeInputStream(void);

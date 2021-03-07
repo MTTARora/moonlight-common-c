@@ -39,11 +39,12 @@ typedef struct _QUEUED_AUDIO_PACKET {
 } QUEUED_AUDIO_PACKET, *PQUEUED_AUDIO_PACKET;
 
 // Initialize the audio stream
-void initializeAudioStream(void) {
+void initializeAudioStream(int port) {
     LbqInitializeLinkedBlockingQueue(&packetQueue, 30);
     RtpqInitializeQueue(&rtpReorderQueue, RTPQ_DEFAULT_MAX_SIZE, RTPQ_DEFAULT_QUEUE_TIME);
     lastSeq = 0;
     receivedDataFromPeer = false;
+    port1 = port;
 }
 
 static void freePacketList(PLINKED_BLOCKING_QUEUE_ENTRY entry) {
@@ -297,9 +298,8 @@ void stopAudioStream(void) {
     AudioCallbacks.cleanup();
 }
 
-int startAudioStream(void* audioContext, int arFlags, int port) {
+int startAudioStream(void* audioContext, int arFlags) {
     int err;
-    port1 = port;
     OPUS_MULTISTREAM_CONFIGURATION chosenConfig;
 
     if (HighQualitySurroundEnabled) {
