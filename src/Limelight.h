@@ -585,7 +585,7 @@ unsigned int LiGetPortFlagsFromTerminationErrorCode(int errorCode);
 int LiGetProtocolFromPortFlagIndex(int portFlagIndex);
 
 // Returns the port number for the specified port index
-unsigned short LiGetPortFromPortFlagIndex(int portFlagIndex);
+unsigned short LiGetPortFromPortFlagIndex(int portFlagIndex, int port1);
 
 // Populates the output buffer with a stringified list of the port flags set in the input argument.
 // The second and subsequent entries will be prepended by 'separator' (if provided).
