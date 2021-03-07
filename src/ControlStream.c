@@ -167,15 +167,18 @@ static short* packetTypes;
 static short* payloadLengths;
 static char**preconstructedPayloads;
 
+static int port1;
+
 #define LOSS_REPORT_INTERVAL_MS 50
 #define PERIODIC_PING_INTERVAL_MS 250
 
 // Initializes the control stream
-int initializeControlStream(void) {
+int initializeControlStream(int port) {
     stopping = false;
     PltCreateEvent(&invalidateRefFramesEvent);
     LbqInitializeLinkedBlockingQueue(&invalidReferenceFrameTuples, 20);
     PltCreateMutex(&enetMutex);
+    port1 = port;
 
     if (AppVersionQuad[0] == 3) {
         packetTypes = (short*)packetTypesGen3;
@@ -826,7 +829,7 @@ int sendInputPacketOnControlStream(unsigned char* data, int length) {
 }
 
 // Starts the control stream
-int startControlStream(int port1) {
+int startControlStream(void) {
     int err;
 
     if (AppVersionQuad[0] >= 5) {

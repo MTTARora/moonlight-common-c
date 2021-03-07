@@ -62,8 +62,8 @@ void fixupMissingCallbacks(PDECODER_RENDERER_CALLBACKS* drCallbacks, PAUDIO_REND
 
 char* getSdpPayloadForStreamConfig(int rtspClientVersion, int* length, int port1);
 
-int initializeControlStream(void);
-int startControlStream(int port1);
+int initializeControlStream(int port1);
+int startControlStream(void);
 int stopControlStream(void);
 void destroyControlStream(void);
 void requestIdrOnDemand(void);
