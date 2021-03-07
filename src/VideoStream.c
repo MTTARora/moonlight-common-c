@@ -24,6 +24,8 @@ static bool receivedDataFromPeer;
 static uint64_t firstDataTimeMs;
 static bool receivedFullFrame;
 
+static int port1;
+
 // We can't request an IDR frame until the depacketizer knows
 // that a packet was lost. This timeout bounds the time that
 // the RTP queue will wait for missing/reordered packets.
@@ -31,12 +33,13 @@ static bool receivedFullFrame;
 
 
 // Initialize the video stream
-void initializeVideoStream(void) {
+void initializeVideoStream(int port) {
     initializeVideoDepacketizer(StreamConfig.packetSize);
     RtpfInitializeQueue(&rtpQueue); //TODO RTP_QUEUE_DELAY
     receivedDataFromPeer = false;
     firstDataTimeMs = 0;
     receivedFullFrame = false;
+    port1 = port;
 }
 
 // Clean up the video stream
@@ -46,7 +49,7 @@ void destroyVideoStream(void) {
 }
 
 // UDP Ping proc
-static void UdpPingThreadProc(void* context, int port1) {
+static void UdpPingThreadProc(void* context) {
     char pingData[] = { 0x50, 0x49, 0x4E, 0x47 };
     struct sockaddr_in6 saddr;
     SOCK_RET err;

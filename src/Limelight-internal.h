@@ -81,7 +81,7 @@ void queueRtpPacket(PRTPFEC_QUEUE_ENTRY queueEntry);
 void stopVideoDepacketizer(void);
 void requestDecoderRefresh(void);
 
-void initializeVideoStream(void);
+void initializeVideoStream(int port1);
 void destroyVideoStream(void);
 int startVideoStream(void* rendererContext, int drFlags);
 void submitFrame(PQUEUED_DECODE_UNIT qdu);
