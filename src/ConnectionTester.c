@@ -19,7 +19,8 @@ unsigned int LiGetPortFlagsFromStage(int stage)
     switch (stage)
     {
         case STAGE_RTSP_HANDSHAKE:
-            return ML_PORT_FLAG_TCP_48010 | ML_PORT_FLAG_UDP_48010;
+            // GFE 3.22 requires a successful ping on 48000 to complete RTSP handshake
+            return ML_PORT_FLAG_TCP_48010 | ML_PORT_FLAG_UDP_48010 | ML_PORT_FLAG_UDP_48000;
 
         case STAGE_CONTROL_STREAM_START:
             return ML_PORT_FLAG_UDP_47999;
@@ -157,7 +158,7 @@ unsigned int LiTestClientConnectivity(const char* testServer, unsigned short ref
                 goto Exit;
             }
 
-            ((struct sockaddr_in6*)&address)->sin6_port = htons(LiGetPortFromPortFlagIndex(i, port1));
+            SET_PORT((LC_SOCKADDR*)&address, LiGetPortFromPortFlagIndex(i, port1)));
             if (LiGetProtocolFromPortFlagIndex(i) == IPPROTO_TCP) {
                 // Initiate an asynchronous connection
                 err = connect(sockets[i], (struct sockaddr*)&address, address_length);

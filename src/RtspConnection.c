@@ -12,6 +12,7 @@ static bool hasSessionId;
 static int rtspClientVersion;
 static char urlAddr[URLSAFESTRING_LEN];
 static bool useEnet;
+static char* controlStreamId;
 
 static SOCKET sock = INVALID_SOCKET;
 static ENetHost* client;
@@ -418,7 +419,8 @@ static bool sendVideoAnnounce(PRTSP_MESSAGE response, int* error, int port1) {
 
     *error = -1;
 
-    ret = initializeRtspRequest(&request, "ANNOUNCE", "streamid=video");
+    ret = initializeRtspRequest(&request, "ANNOUNCE",
+                                APP_VERSION_AT_LEAST(7, 1, 431) ? controlStreamId : "streamid=video");
     if (ret) {
         ret = false;
 
@@ -604,6 +606,7 @@ int performRtspHandshake(int port1) {
     sprintf(rtspTargetUrl, "rtsp%s://%s:48010", useEnet ? "ru" : "", urlAddr);
     currentSeqNumber = 1;
     hasSessionId = false;
+    controlStreamId = APP_VERSION_AT_LEAST(7, 1, 431) ? "streamid=control/13/0" : "streamid=control/1/0";
 
     switch (AppVersionQuad[0]) {
         case 3:
@@ -808,7 +811,9 @@ int performRtspHandshake(int port1) {
         RTSP_MESSAGE response;
         int error = -1;
 
-        if (!setupStream(&response, "streamid=control/1/0", &error, port1)) {
+        if (!setupStream(&response,
+                         controlStreamId,
+                         &error, port1)) {
             Limelog("RTSP SETUP streamid=control request failed: %d\n", error);
             ret = error;
             goto Exit;
@@ -844,18 +849,19 @@ int performRtspHandshake(int port1) {
         freeMessage(&response);
     }
 
-    {
+    // GFE 3.22 uses a single PLAY message
+    if (APP_VERSION_AT_LEAST(7, 1, 431)) {
         RTSP_MESSAGE response;
         int error = -1;
 
-        if (!playStream(&response, "streamid=video", &error, port1)) {
-            Limelog("RTSP PLAY streamid=video request failed: %d\n", error);
+        if (!playStream(&response, "/", &error, port1)) {
+            Limelog("RTSP PLAY request failed: %d\n", error);
             ret = error;
             goto Exit;
         }
 
         if (response.message.response.statusCode != 200) {
-            Limelog("RTSP PLAY streamid=video failed: %d\n",
+            Limelog("RTSP PLAY failed: %d\n",
                 response.message.response.statusCode);
             ret = response.message.response.statusCode;
             goto Exit;
@@ -863,26 +869,48 @@ int performRtspHandshake(int port1) {
 
         freeMessage(&response);
     }
+    else {
+        {
+            RTSP_MESSAGE response;
+            int error = -1;
 
-    {
-        RTSP_MESSAGE response;
-        int error = -1;
+            if (!playStream(&response, "streamid=video", &error, port1))) {
+                Limelog("RTSP PLAY streamid=video request failed: %d\n", error);
+                ret = error;
+                goto Exit;
+            }
 
-        if (!playStream(&response, "streamid=audio", &error, port1)) {
-            Limelog("RTSP PLAY streamid=audio request failed: %d\n", error);
-            ret = error;
-            goto Exit;
+            if (response.message.response.statusCode != 200) {
+                Limelog("RTSP PLAY streamid=video failed: %d\n",
+                    response.message.response.statusCode);
+                ret = response.message.response.statusCode;
+                goto Exit;
+            }
+
+            freeMessage(&response);
         }
 
-        if (response.message.response.statusCode != 200) {
-            Limelog("RTSP PLAY streamid=audio failed: %d\n",
-                response.message.response.statusCode);
-            ret = response.message.response.statusCode;
-            goto Exit;
-        }
+        {
+            RTSP_MESSAGE response;
+            int error = -1;
 
-        freeMessage(&response);
+            if (!playStream(&response, "streamid=audio", &error, port1)) {
+                Limelog("RTSP PLAY streamid=audio request failed: %d\n", error);
+                ret = error;
+                goto Exit;
+            }
+
+            if (response.message.response.statusCode != 200) {
+                Limelog("RTSP PLAY streamid=audio failed: %d\n",
+                    response.message.response.statusCode);
+                ret = response.message.response.statusCode;
+                goto Exit;
+            }
+
+            freeMessage(&response);
+        }
     }
+
     
     ret = 0;
     
