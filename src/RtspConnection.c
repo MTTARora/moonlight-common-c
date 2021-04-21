@@ -209,7 +209,7 @@ Exit:
 }
 
 // Send RTSP message and get response over TCP
-static bool transactRtspMessageTcp(PRTSP_MESSAGE request, PRTSP_MESSAGE response, bool expectingPayload, int* error) {
+static bool transactRtspMessageTcp(PRTSP_MESSAGE request, PRTSP_MESSAGE response, bool expectingPayload, int* error, int port1) {
     SOCK_RET err;
     bool ret;
     int offset;
@@ -222,7 +222,7 @@ static bool transactRtspMessageTcp(PRTSP_MESSAGE request, PRTSP_MESSAGE response
     ret = false;
     responseBuffer = NULL;
 
-    sock = connectTcpSocket(&RemoteAddr, RemoteAddrLen, 48010, RTSP_TIMEOUT_SEC);
+    sock = connectTcpSocket(&RemoteAddr, RemoteAddrLen, port1+2, RTSP_TIMEOUT_SEC);
     if (sock == INVALID_SOCKET) {
         *error = LastSocketError();
         return ret;
@@ -297,17 +297,17 @@ Exit:
     return ret;
 }
 
-static bool transactRtspMessage(PRTSP_MESSAGE request, PRTSP_MESSAGE response, bool expectingPayload, int* error) {
+static bool transactRtspMessage(PRTSP_MESSAGE request, PRTSP_MESSAGE response, bool expectingPayload, int* error, int port1) {
     if (useEnet) {
         return transactRtspMessageEnet(request, response, expectingPayload, error);
     }
     else {
-        return transactRtspMessageTcp(request, response, expectingPayload, error);
+        return transactRtspMessageTcp(request, response, expectingPayload, error, port1);
     }
 }
 
 // Send RTSP OPTIONS request
-static bool requestOptions(PRTSP_MESSAGE response, int* error) {
+static bool requestOptions(PRTSP_MESSAGE response, int* error, int port1) {
     RTSP_MESSAGE request;
     bool ret;
 
@@ -315,7 +315,7 @@ static bool requestOptions(PRTSP_MESSAGE response, int* error) {
 
     ret = initializeRtspRequest(&request, "OPTIONS", rtspTargetUrl);
     if (ret) {
-        ret = transactRtspMessage(&request, response, false, error);
+        ret = transactRtspMessage(&request, response, false, error, port1);
         freeMessage(&request);
     }
 
@@ -323,7 +323,7 @@ static bool requestOptions(PRTSP_MESSAGE response, int* error) {
 }
 
 // Send RTSP DESCRIBE request
-static bool requestDescribe(PRTSP_MESSAGE response, int* error) {
+static bool requestDescribe(PRTSP_MESSAGE response, int* error, int port1) {
     RTSP_MESSAGE request;
     bool ret;
 
@@ -335,7 +335,7 @@ static bool requestDescribe(PRTSP_MESSAGE response, int* error) {
             "application/sdp") &&
             addOption(&request, "If-Modified-Since",
                 "Thu, 01 Jan 1970 00:00:00 GMT")) {
-            ret = transactRtspMessage(&request, response, true, error);
+            ret = transactRtspMessage(&request, response, true, error, port1);
         }
         else {
             ret = false;
@@ -347,7 +347,7 @@ static bool requestDescribe(PRTSP_MESSAGE response, int* error) {
 }
 
 // Send RTSP SETUP request
-static bool setupStream(PRTSP_MESSAGE response, char* target, int* error) {
+static bool setupStream(PRTSP_MESSAGE response, char* target, int* error, int port1) {
     RTSP_MESSAGE request;
     bool ret;
     char* transportValue;
@@ -376,7 +376,7 @@ static bool setupStream(PRTSP_MESSAGE response, char* target, int* error) {
         if (addOption(&request, "Transport", transportValue) &&
             addOption(&request, "If-Modified-Since",
                 "Thu, 01 Jan 1970 00:00:00 GMT")) {
-            ret = transactRtspMessage(&request, response, false, error);
+            ret = transactRtspMessage(&request, response, false, error, port1);
         }
         else {
             ret = false;
@@ -390,7 +390,7 @@ static bool setupStream(PRTSP_MESSAGE response, char* target, int* error) {
 }
 
 // Send RTSP PLAY request
-static bool playStream(PRTSP_MESSAGE response, char* target, int* error) {
+static bool playStream(PRTSP_MESSAGE response, char* target, int* error, int port1) {
     RTSP_MESSAGE request;
     bool ret;
 
@@ -399,7 +399,7 @@ static bool playStream(PRTSP_MESSAGE response, char* target, int* error) {
     ret = initializeRtspRequest(&request, "PLAY", target);
     if (ret != 0) {
         if (addOption(&request, "Session", sessionIdString)) {
-            ret = transactRtspMessage(&request, response, false, error);
+            ret = transactRtspMessage(&request, response, false, error, port1);
         }
         else {
             ret = false;
@@ -411,7 +411,7 @@ static bool playStream(PRTSP_MESSAGE response, char* target, int* error) {
 }
 
 // Send RTSP ANNOUNCE message
-static bool sendVideoAnnounce(PRTSP_MESSAGE response, int* error) {
+static bool sendVideoAnnounce(PRTSP_MESSAGE response, int* error, int port1) {
     RTSP_MESSAGE request;
     bool ret;
     int payloadLength;
@@ -429,7 +429,7 @@ static bool sendVideoAnnounce(PRTSP_MESSAGE response, int* error) {
             goto FreeMessage;
         }
 
-        request.payload = getSdpPayloadForStreamConfig(rtspClientVersion, &payloadLength);
+        request.payload = getSdpPayloadForStreamConfig(rtspClientVersion, &payloadLength, port1);
         if (request.payload == NULL) {
             goto FreeMessage;
         }
@@ -441,7 +441,7 @@ static bool sendVideoAnnounce(PRTSP_MESSAGE response, int* error) {
             goto FreeMessage;
         }
 
-        ret = transactRtspMessage(&request, response, false, error);
+        ret = transactRtspMessage(&request, response, false, error, port1);
 
     FreeMessage:
         freeMessage(&request);
@@ -586,7 +586,7 @@ static int parseOpusConfigurations(PRTSP_MESSAGE response) {
 }
 
 // Perform RTSP Handshake with the streaming server machine as part of the connection process
-int performRtspHandshake(void) {
+int performRtspHandshake(int port1) {
     int ret;
 
     // HACK: In order to get GFE to respect our request for a lower audio bitrate, we must
@@ -634,7 +634,7 @@ int performRtspHandshake(void) {
         ENetEvent event;
         
         enet_address_set_address(&address, (struct sockaddr *)&RemoteAddr, RemoteAddrLen);
-        enet_address_set_port(&address, 48010);
+        enet_address_set_port(&address, port1+2);
         
         // Create a client that can use 1 outgoing connection and 1 channel
         client = enet_host_create(RemoteAddr.ss_family, NULL, 1, 1, 0, 0);
@@ -669,7 +669,7 @@ int performRtspHandshake(void) {
         RTSP_MESSAGE response;
         int error = -1;
 
-        if (!requestOptions(&response, &error)) {
+        if (!requestOptions(&response, &error, port1)) {
             Limelog("RTSP OPTIONS request failed: %d\n", error);
             ret = error;
             goto Exit;
@@ -689,7 +689,7 @@ int performRtspHandshake(void) {
         RTSP_MESSAGE response;
         int error = -1;
 
-        if (!requestDescribe(&response, &error)) {
+        if (!requestDescribe(&response, &error, port1)) {
             Limelog("RTSP DESCRIBE request failed: %d\n", error);
             ret = error;
             goto Exit;
@@ -747,7 +747,7 @@ int performRtspHandshake(void) {
 
         if (!setupStream(&response,
                          AppVersionQuad[0] >= 5 ? "streamid=audio/0/0" : "streamid=audio",
-                         &error)) {
+                         &error, port1)) {
             Limelog("RTSP SETUP streamid=audio request failed: %d\n", error);
             ret = error;
             goto Exit;
@@ -791,7 +791,7 @@ int performRtspHandshake(void) {
 
         if (!setupStream(&response,
                          AppVersionQuad[0] >= 5 ? "streamid=video/0/0" : "streamid=video",
-                         &error)) {
+                         &error, port1)) {
             Limelog("RTSP SETUP streamid=video request failed: %d\n", error);
             ret = error;
             goto Exit;
@@ -813,7 +813,7 @@ int performRtspHandshake(void) {
 
         if (!setupStream(&response,
                          controlStreamId,
-                         &error)) {
+                         &error, port1)) {
             Limelog("RTSP SETUP streamid=control request failed: %d\n", error);
             ret = error;
             goto Exit;
@@ -833,7 +833,7 @@ int performRtspHandshake(void) {
         RTSP_MESSAGE response;
         int error = -1;
 
-        if (!sendVideoAnnounce(&response, &error)) {
+        if (!sendVideoAnnounce(&response, &error, port1)) {
             Limelog("RTSP ANNOUNCE request failed: %d\n", error);
             ret = error;
             goto Exit;
@@ -854,7 +854,7 @@ int performRtspHandshake(void) {
         RTSP_MESSAGE response;
         int error = -1;
 
-        if (!playStream(&response, "/", &error)) {
+        if (!playStream(&response, "/", &error, port1)) {
             Limelog("RTSP PLAY request failed: %d\n", error);
             ret = error;
             goto Exit;
@@ -874,7 +874,7 @@ int performRtspHandshake(void) {
             RTSP_MESSAGE response;
             int error = -1;
 
-            if (!playStream(&response, "streamid=video", &error)) {
+            if (!playStream(&response, "streamid=video", &error, port1))) {
                 Limelog("RTSP PLAY streamid=video request failed: %d\n", error);
                 ret = error;
                 goto Exit;
@@ -894,7 +894,7 @@ int performRtspHandshake(void) {
             RTSP_MESSAGE response;
             int error = -1;
 
-            if (!playStream(&response, "streamid=audio", &error)) {
+            if (!playStream(&response, "streamid=audio", &error, port1)) {
                 Limelog("RTSP PLAY streamid=audio request failed: %d\n", error);
                 ret = error;
                 goto Exit;

@@ -66,9 +66,9 @@ void* extendBuffer(void* ptr, size_t newSize);
 void fixupMissingCallbacks(PDECODER_RENDERER_CALLBACKS* drCallbacks, PAUDIO_RENDERER_CALLBACKS* arCallbacks,
     PCONNECTION_LISTENER_CALLBACKS* clCallbacks);
 
-char* getSdpPayloadForStreamConfig(int rtspClientVersion, int* length);
+char* getSdpPayloadForStreamConfig(int rtspClientVersion, int* length, int port1);
 
-int initializeControlStream(void);
+int initializeControlStream(int port1);
 int startControlStream(void);
 int stopControlStream(void);
 void destroyControlStream(void);
@@ -79,7 +79,7 @@ void connectionSawFrame(int frameIndex);
 void connectionLostPackets(int lastReceivedPacket, int nextReceivedPacket);
 int sendInputPacketOnControlStream(unsigned char* data, int length);
 
-int performRtspHandshake(void);
+int performRtspHandshake(int port1);
 
 void initializeVideoDepacketizer(int pktSize);
 void destroyVideoDepacketizer(void);
@@ -87,13 +87,13 @@ void queueRtpPacket(PRTPFEC_QUEUE_ENTRY queueEntry);
 void stopVideoDepacketizer(void);
 void requestDecoderRefresh(void);
 
-void initializeVideoStream(void);
+void initializeVideoStream(int port1);
 void destroyVideoStream(void);
 int startVideoStream(void* rendererContext, int drFlags);
 void submitFrame(PQUEUED_DECODE_UNIT qdu);
 void stopVideoStream(void);
 
-int initializeAudioStream(void);
+int initializeAudioStream(int port1);
 void destroyAudioStream(void);
 int startAudioStream(void* audioContext, int arFlags);
 void stopAudioStream(void);

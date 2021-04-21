@@ -50,27 +50,34 @@ int LiGetProtocolFromPortFlagIndex(int portFlagIndex)
     return (portFlagIndex >= 8) ? IPPROTO_UDP : IPPROTO_TCP;
 }
 
-unsigned short LiGetPortFromPortFlagIndex(int portFlagIndex)
+unsigned short LiGetPortFromPortFlagIndex(int portFlagIndex, int port1)
 {
     switch (portFlagIndex)
     {
         // TCP ports
         case ML_PORT_INDEX_TCP_47984:
-            return 47984;
+            return port1;
+//            return 47984;
         case ML_PORT_INDEX_TCP_47989:
-            return 47989;
+            return port1+1;
+//            return 47989;
         case ML_PORT_INDEX_TCP_48010:
-            return 48010;
+            return port1+2;
+//            return 48010;
 
         // UDP ports
         case ML_PORT_INDEX_UDP_47998:
-            return 47998;
+            return port1+3;
+//            return 47998;
         case ML_PORT_INDEX_UDP_47999:
-            return 47999;
+            return port1+4;
+//            return 47999;
         case ML_PORT_INDEX_UDP_48000:
-            return 48000;
+            return port1+5;
+//            return 48000;
         case ML_PORT_INDEX_UDP_48010:
-            return 48010;
+            return port1+2;
+//            return 48010;
 
         default:
             LC_ASSERT(false);
@@ -78,7 +85,7 @@ unsigned short LiGetPortFromPortFlagIndex(int portFlagIndex)
     }
 }
 
-void LiStringifyPortFlags(unsigned int portFlags, const char* separator, char* outputBuffer, int outputBufferLength)
+void LiStringifyPortFlags(unsigned int portFlags, const char* separator, char* outputBuffer, int outputBufferLength, int port1)
 {
     // Initialize the output buffer to an empty string
     outputBuffer[0] = 0;
@@ -95,7 +102,7 @@ void LiStringifyPortFlags(unsigned int portFlags, const char* separator, char* o
             offset += snprintf(&outputBuffer[offset], outputBufferLength - offset, "%s%s %u",
                                offset != 0 ? separator : "",
                                protoStr,
-                               LiGetPortFromPortFlagIndex(i));
+                               LiGetPortFromPortFlagIndex(i, port1));
             if (outputBufferLength - offset <= 0) {
                 // snprintf() will return the desired length if the buffer is too small,
                 // so it is possible for this calculation to be negative.
@@ -105,7 +112,7 @@ void LiStringifyPortFlags(unsigned int portFlags, const char* separator, char* o
     }
 }
 
-unsigned int LiTestClientConnectivity(const char* testServer, unsigned short referencePort, unsigned int testPortFlags)
+unsigned int LiTestClientConnectivity(const char* testServer, unsigned short referencePort, unsigned int testPortFlags, int port1)
 {
     unsigned int failingPortFlags;
     struct sockaddr_storage address;
@@ -151,14 +158,14 @@ unsigned int LiTestClientConnectivity(const char* testServer, unsigned short ref
                 goto Exit;
             }
 
-            SET_PORT((LC_SOCKADDR*)&address, LiGetPortFromPortFlagIndex(i));
+            SET_PORT((LC_SOCKADDR*)&address, LiGetPortFromPortFlagIndex(i, port1)));
             if (LiGetProtocolFromPortFlagIndex(i) == IPPROTO_TCP) {
                 // Initiate an asynchronous connection
                 err = connect(sockets[i], (struct sockaddr*)&address, address_length);
                 if (err < 0) {
                     err = (int)LastSocketError();
                     if (err != EWOULDBLOCK && err != EAGAIN && err != EINPROGRESS) {
-                        Limelog("Failed to start async connect to TCP %u: %d\n", LiGetPortFromPortFlagIndex(i), err);
+                        Limelog("Failed to start async connect to TCP %u: %d\n", LiGetPortFromPortFlagIndex(i, port1), err);
 
                         // Mask off this bit so we don't try to include it in pollSockets() below
                         testPortFlags &= ~(1U << i);
@@ -174,7 +181,7 @@ unsigned int LiTestClientConnectivity(const char* testServer, unsigned short ref
                     err = sendto(sockets[i], buf, sizeof(buf), 0, (struct sockaddr*)&address, address_length);
                     if (err < 0) {
                         err = (int)LastSocketError();
-                        Limelog("Failed to send test packet to UDP %u: %d\n", LiGetPortFromPortFlagIndex(i), err);
+                        Limelog("Failed to send test packet to UDP %u: %d\n", LiGetPortFromPortFlagIndex(i, port1), err);
 
                         // Mask off this bit so we don't try to include it in pollSockets() below
                         testPortFlags &= ~(1U << i);
@@ -261,11 +268,11 @@ unsigned int LiTestClientConnectivity(const char* testServer, unsigned short ref
                         // The UDP test was a success.
                         failingPortFlags &= ~(1U << portIndex);
 
-                        Limelog("UDP port %u test successful\n", LiGetPortFromPortFlagIndex(portIndex));
+                        Limelog("UDP port %u test successful\n", LiGetPortFromPortFlagIndex(portIndex, port1));
                     }
                     else {
                         err = LastSocketError();
-                        Limelog("UDP port %u test failed: %d\n", LiGetPortFromPortFlagIndex(portIndex), err);
+                        Limelog("UDP port %u test failed: %d\n", LiGetPortFromPortFlagIndex(portIndex, port1), err);
                     }
                 }
                 else {
@@ -283,10 +290,10 @@ unsigned int LiTestClientConnectivity(const char* testServer, unsigned short ref
                         // The TCP test was a success
                         failingPortFlags &= ~(1U << portIndex);
 
-                        Limelog("TCP port %u test successful\n", LiGetPortFromPortFlagIndex(portIndex));
+                        Limelog("TCP port %u test successful\n", LiGetPortFromPortFlagIndex(portIndex, port1));
                     }
                     else {
-                        Limelog("TCP port %u test failed: %d\n", LiGetPortFromPortFlagIndex(portIndex), err);
+                        Limelog("TCP port %u test failed: %d\n", LiGetPortFromPortFlagIndex(portIndex, port1), err);
                     }
                 }
             }

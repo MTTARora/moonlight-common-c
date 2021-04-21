@@ -6,6 +6,7 @@ static ConnListenerConnectionTerminated originalTerminationCallback;
 static bool alreadyTerminated;
 static PLT_THREAD terminationCallbackThread;
 static int terminationCallbackErrorCode;
+static int port1 = 0;
 
 // Common globals
 char* RemoteAddrString;
@@ -170,8 +171,9 @@ static void ClInternalConnectionTerminated(int errorCode)
 // Starts the connection to the streaming machine
 int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION streamConfig, PCONNECTION_LISTENER_CALLBACKS clCallbacks,
     PDECODER_RENDERER_CALLBACKS drCallbacks, PAUDIO_RENDERER_CALLBACKS arCallbacks, void* renderContext, int drFlags,
-    void* audioContext, int arFlags) {
+    void* audioContext, int arFlags, int port) {
     int err;
+    port1 = port;
 
     // Replace missing callbacks with placeholders
     fixupMissingCallbacks(&drCallbacks, &arCallbacks, &clCallbacks);
@@ -253,12 +255,12 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
 
     Limelog("Resolving host name...");
     ListenerCallbacks.stageStarting(STAGE_NAME_RESOLUTION);
-    err = resolveHostName(serverInfo->address, AF_UNSPEC, 47984, &RemoteAddr, &RemoteAddrLen);
+    err = resolveHostName(serverInfo->address, AF_UNSPEC, port1, &RemoteAddr, &RemoteAddrLen);
     if (err != 0) {
-        err = resolveHostName(serverInfo->address, AF_UNSPEC, 47989, &RemoteAddr, &RemoteAddrLen);
+        err = resolveHostName(serverInfo->address, AF_UNSPEC, port1 + 1, &RemoteAddr, &RemoteAddrLen);
     }
     if (err != 0) {
-        err = resolveHostName(serverInfo->address, AF_UNSPEC, 48010, &RemoteAddr, &RemoteAddrLen);
+        err = resolveHostName(serverInfo->address, AF_UNSPEC, port1 + 2, &RemoteAddr, &RemoteAddrLen);
     }
     if (err != 0) {
         Limelog("failed: %d\n", err);
@@ -291,7 +293,7 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
 
     Limelog("Initializing audio stream...");
     ListenerCallbacks.stageStarting(STAGE_AUDIO_STREAM_INIT);
-    err = initializeAudioStream();
+    err = initializeAudioStream(port1);
     if (err != 0) {
         Limelog("failed: %d\n", err);
         ListenerCallbacks.stageFailed(STAGE_AUDIO_STREAM_INIT, err);
@@ -304,7 +306,7 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
 
     Limelog("Starting RTSP handshake...");
     ListenerCallbacks.stageStarting(STAGE_RTSP_HANDSHAKE);
-    err = performRtspHandshake();
+    err = performRtspHandshake(port1);
     if (err != 0) {
         Limelog("failed: %d\n", err);
         ListenerCallbacks.stageFailed(STAGE_RTSP_HANDSHAKE, err);
@@ -317,7 +319,7 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
 
     Limelog("Initializing control stream...");
     ListenerCallbacks.stageStarting(STAGE_CONTROL_STREAM_INIT);
-    err = initializeControlStream();
+    err = initializeControlStream(port1);
     if (err != 0) {
         Limelog("failed: %d\n", err);
         ListenerCallbacks.stageFailed(STAGE_CONTROL_STREAM_INIT, err);
@@ -330,7 +332,7 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
 
     Limelog("Initializing video stream...");
     ListenerCallbacks.stageStarting(STAGE_VIDEO_STREAM_INIT);
-    initializeVideoStream();
+    initializeVideoStream(port1);
     stage++;
     LC_ASSERT(stage == STAGE_VIDEO_STREAM_INIT);
     ListenerCallbacks.stageComplete(STAGE_VIDEO_STREAM_INIT);

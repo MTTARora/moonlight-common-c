@@ -17,7 +17,8 @@ static unsigned short lastSeq;
 
 static bool receivedDataFromPeer;
 
-#define RTP_PORT 48000
+static int port1 = 0;
+//#define RTP_PORT 48000
 
 #define MAX_PACKET_SIZE 1400
 
@@ -44,7 +45,7 @@ static void UdpPingThreadProc(void* context) {
     SOCK_RET err;
 
     memcpy(&saddr, &RemoteAddr, sizeof(saddr));
-    SET_PORT(&saddr, RTP_PORT);
+    SET_PORT(&saddr, port1+5);
 
     // Send PING every second until we get data back then every 5 seconds after that.
     while (!PltIsThreadInterrupted(&udpPingThread)) {
@@ -59,12 +60,13 @@ static void UdpPingThreadProc(void* context) {
     }
 }
 
-// Initialize the audio stream and start
-int initializeAudioStream(void) {
+// Initialize the audio stream
+void initializeAudioStream(int port) {
     LbqInitializeLinkedBlockingQueue(&packetQueue, 30);
     RtpqInitializeQueue(&rtpReorderQueue, RTPQ_DEFAULT_MAX_SIZE, RTPQ_DEFAULT_QUEUE_TIME);
     lastSeq = 0;
     receivedDataFromPeer = false;
+    port1 = port;
 
     // For GFE 3.22 compatibility, we must start the audio ping thread before the RTSP handshake.
     // It will not reply to our RTSP PLAY request until the audio ping has been received.

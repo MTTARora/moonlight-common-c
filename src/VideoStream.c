@@ -6,7 +6,7 @@
 #define FIRST_FRAME_MAX 1500
 #define FIRST_FRAME_TIMEOUT_SEC 10
 
-#define RTP_PORT 47998
+//#define RTP_PORT 47998
 #define FIRST_FRAME_PORT 47996
 
 #define RTP_RECV_BUFFER (512 * 1024)
@@ -24,6 +24,8 @@ static bool receivedDataFromPeer;
 static uint64_t firstDataTimeMs;
 static bool receivedFullFrame;
 
+static int port1;
+
 // We can't request an IDR frame until the depacketizer knows
 // that a packet was lost. This timeout bounds the time that
 // the RTP queue will wait for missing/reordered packets.
@@ -31,12 +33,13 @@ static bool receivedFullFrame;
 
 
 // Initialize the video stream
-void initializeVideoStream(void) {
+void initializeVideoStream(int port) {
     initializeVideoDepacketizer(StreamConfig.packetSize);
     RtpfInitializeQueue(&rtpQueue); //TODO RTP_QUEUE_DELAY
     receivedDataFromPeer = false;
     firstDataTimeMs = 0;
     receivedFullFrame = false;
+    port1 = port;
 }
 
 // Clean up the video stream
@@ -52,7 +55,7 @@ static void UdpPingThreadProc(void* context) {
     SOCK_RET err;
 
     memcpy(&saddr, &RemoteAddr, sizeof(saddr));
-    SET_PORT(&saddr, RTP_PORT);
+    SET_PORT(&saddr, port1+3);
 
     while (!PltIsThreadInterrupted(&udpPingThread)) {
         err = sendto(rtpSocket, pingData, sizeof(pingData), 0, (struct sockaddr*)&saddr, RemoteAddrLen);

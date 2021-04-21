@@ -196,15 +196,18 @@ static short* packetTypes;
 static short* payloadLengths;
 static char**preconstructedPayloads;
 
+static int port1;
+
 #define LOSS_REPORT_INTERVAL_MS 50
 #define PERIODIC_PING_INTERVAL_MS 250
 
 // Initializes the control stream
-int initializeControlStream(void) {
+int initializeControlStream(int port) {
     stopping = false;
     PltCreateEvent(&invalidateRefFramesEvent);
     LbqInitializeLinkedBlockingQueue(&invalidReferenceFrameTuples, 20);
     PltCreateMutex(&enetMutex);
+    port1 = port;
 
     encryptedControlStream = APP_VERSION_AT_LEAST(7, 1, 431);
 
@@ -1063,7 +1066,7 @@ int startControlStream(void) {
         ENetEvent event;
         
         enet_address_set_address(&address, (struct sockaddr *)&RemoteAddr, RemoteAddrLen);
-        enet_address_set_port(&address, 47999);
+        enet_address_set_port(&address, port1+4);
 
         // Create a client that can use 1 outgoing connection and 1 channel
         client = enet_host_create(address.address.ss_family, NULL, 1, 1, 0, 0);
