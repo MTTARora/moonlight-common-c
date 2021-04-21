@@ -12,9 +12,23 @@ typedef struct _NVCTL_TCP_PACKET_HEADER {
     unsigned short payloadLength;
 } NVCTL_TCP_PACKET_HEADER, *PNVCTL_TCP_PACKET_HEADER;
 
-typedef struct _NVCTL_ENET_PACKET_HEADER {
+typedef struct _NVCTL_ENET_PACKET_HEADER_V1 {
     unsigned short type;
-} NVCTL_ENET_PACKET_HEADER, *PNVCTL_ENET_PACKET_HEADER;
+} NVCTL_ENET_PACKET_HEADER_V1, *PNVCTL_ENET_PACKET_HEADER_V1;
+
+typedef struct _NVCTL_ENET_PACKET_HEADER_V2 {
+    unsigned short type;
+    unsigned short payloadLength;
+} NVCTL_ENET_PACKET_HEADER_V2, *PNVCTL_ENET_PACKET_HEADER_V2;
+
+#define AES_GCM_TAG_LENGTH 16
+typedef struct _NVCTL_ENCRYPTED_PACKET_HEADER {
+    unsigned short encryptedHeaderType; // Always LE 0x0001
+    unsigned short length; // sizeof(seq) + 16 byte tag + secondary header and data
+    unsigned int seq; // Monotonically increasing sequence number (used as IV for AES-GCM)
+
+    // encrypted NVCTL_ENET_PACKET_HEADER_V2 and payload data follow
+} NVCTL_ENCRYPTED_PACKET_HEADER, *PNVCTL_ENCRYPTED_PACKET_HEADER;
 
 typedef struct _QUEUED_FRAME_INVALIDATION_TUPLE {
     int startFrame;
@@ -37,15 +51,20 @@ static int lastGoodFrame;
 static int lastSeenFrame;
 static bool stopping;
 static bool disconnectPending;
+static bool encryptedControlStream;
 
 static int intervalGoodFrameCount;
 static int intervalTotalFrameCount;
 static uint64_t intervalStartTimeMs;
 static int lastIntervalLossPercentage;
 static int lastConnectionStatusUpdate;
+static int currentEnetSequenceNumber;
 
 static bool idrFrameRequired;
 static LINKED_BLOCKING_QUEUE invalidReferenceFrameTuples;
+
+static PPLT_CRYPTO_CONTEXT encryptionCtx;
+static PPLT_CRYPTO_CONTEXT decryptionCtx;
 
 #define CONN_IMMEDIATE_POOR_LOSS_RATE 30
 #define CONN_CONSECUTIVE_POOR_LOSS_RATE 15
@@ -102,6 +121,16 @@ static const short packetTypesGen7[] = {
     0x0206, // Input data
     0x010b, // Rumble data
     0x0100, // Termination
+};
+static const short packetTypesGen7Enc[] = {
+    0x0305, // Start A
+    0x0307, // Start B
+    0x0301, // Invalidate reference frames
+    0x0201, // Loss Stats
+    0x0204, // Frame Stats (unused)
+    0x0206, // Input data
+    0x010b, // Rumble data
+    0x0109, // Termination (extended)
 };
 
 static const char requestIdrFrameGen3[] = { 0, 0 };
@@ -177,6 +206,8 @@ int initializeControlStream(void) {
     LbqInitializeLinkedBlockingQueue(&invalidReferenceFrameTuples, 20);
     PltCreateMutex(&enetMutex);
 
+    encryptedControlStream = APP_VERSION_AT_LEAST(7, 1, 431);
+
     if (AppVersionQuad[0] == 3) {
         packetTypes = (short*)packetTypesGen3;
         payloadLengths = (short*)payloadLengthsGen3;
@@ -193,7 +224,12 @@ int initializeControlStream(void) {
         preconstructedPayloads = (char**)preconstructedPayloadsGen5;
     }
     else {
-        packetTypes = (short*)packetTypesGen7;
+        if (encryptedControlStream) {
+            packetTypes = (short*)packetTypesGen7Enc;
+        }
+        else {
+            packetTypes = (short*)packetTypesGen7;
+        }
         payloadLengths = (short*)payloadLengthsGen7;
         preconstructedPayloads = (char**)preconstructedPayloadsGen7;
     }
@@ -208,9 +244,10 @@ int initializeControlStream(void) {
     intervalStartTimeMs = 0;
     lastIntervalLossPercentage = 0;
     lastConnectionStatusUpdate = CONN_STATUS_OKAY;
-    usePeriodicPing = (AppVersionQuad[0] > 7) ||
-            (AppVersionQuad[0] == 7 && AppVersionQuad[1] > 1) ||
-            (AppVersionQuad[0] == 7 && AppVersionQuad[1] == 1 && AppVersionQuad[2] >= 415);
+    currentEnetSequenceNumber = 0;
+    usePeriodicPing = APP_VERSION_AT_LEAST(7, 1, 415);
+    encryptionCtx = PltCreateCryptoContext();
+    decryptionCtx = PltCreateCryptoContext();
 
     return 0;
 }
@@ -228,6 +265,8 @@ void freeFrameInvalidationList(PLINKED_BLOCKING_QUEUE_ENTRY entry) {
 // Cleans up control stream
 void destroyControlStream(void) {
     LC_ASSERT(stopping);
+    PltDestroyCryptoContext(encryptionCtx);
+    PltDestroyCryptoContext(decryptionCtx);
     PltCloseEvent(&invalidateRefFramesEvent);
     freeFrameInvalidationList(LbqDestroyLinkedBlockingQueue(&invalidReferenceFrameTuples));
     PltDeleteMutex(&enetMutex);
@@ -330,6 +369,9 @@ static PNVCTL_TCP_PACKET_HEADER readNvctlPacketTcp(void) {
         return NULL;
     }
 
+    staticHeader.type = LE16(staticHeader.type);
+    staticHeader.payloadLength = LE16(staticHeader.payloadLength);
+
     fullPacket = (PNVCTL_TCP_PACKET_HEADER)malloc(staticHeader.payloadLength + sizeof(staticHeader));
     if (fullPacket == NULL) {
         return NULL;
@@ -347,21 +389,127 @@ static PNVCTL_TCP_PACKET_HEADER readNvctlPacketTcp(void) {
     return fullPacket;
 }
 
+static bool encryptControlMessage(PNVCTL_ENCRYPTED_PACKET_HEADER encPacket, PNVCTL_ENET_PACKET_HEADER_V2 packet) {
+    unsigned char iv[16];
+    int encryptedSize = sizeof(*packet) + packet->payloadLength;
+
+    encPacket->encryptedHeaderType = LE16(encPacket->encryptedHeaderType);
+    encPacket->length = LE16(encPacket->length);
+    encPacket->seq = LE32(encPacket->seq);
+
+    packet->type = LE16(packet->type);
+    packet->payloadLength = LE16(packet->payloadLength);
+
+    // This is a truncating cast, but it's what Nvidia does, so we have to mimic it.
+    memset(iv, 0, sizeof(iv));
+    iv[0] = (unsigned char)encPacket->seq;
+
+    return PltEncryptMessage(encryptionCtx, ALGORITHM_AES_GCM,
+                             (unsigned char*)StreamConfig.remoteInputAesKey, sizeof(StreamConfig.remoteInputAesKey),
+                             iv, sizeof(iv),
+                             (unsigned char*)(encPacket + 1), AES_GCM_TAG_LENGTH, // Write tag into the space after the encrypted header
+                             (unsigned char*)packet, encryptedSize,
+                             ((unsigned char*)(encPacket + 1)) + AES_GCM_TAG_LENGTH, &encryptedSize); // Write ciphertext after the GCM tag
+}
+
+// Caller must free() *packet on success!!!
+static bool decryptControlMessageToV1(PNVCTL_ENCRYPTED_PACKET_HEADER encPacket, PNVCTL_ENET_PACKET_HEADER_V1* packet, int* packetLength) {
+    unsigned char iv[16];
+
+    *packet = NULL;
+
+    // It must be an encrypted packet to begin with
+    LC_ASSERT(encPacket->encryptedHeaderType == 0x0001);
+
+    // Check length first so we don't underflow
+    if (encPacket->length < sizeof(encPacket->seq) + AES_GCM_TAG_LENGTH + sizeof(NVCTL_ENET_PACKET_HEADER_V2)) {
+        Limelog("Received runt packet (%d). Unable to decrypt.\n", encPacket->length);
+        return false;
+    }
+
+    // This is a truncating cast, but it's what Nvidia does, so we have to mimic it.
+    memset(iv, 0, sizeof(iv));
+    iv[0] = (unsigned char)encPacket->seq;
+
+    int plaintextLength = encPacket->length - sizeof(encPacket->seq) - AES_GCM_TAG_LENGTH;
+    *packet = malloc(plaintextLength);
+    if (*packet == NULL) {
+        return false;
+    }
+
+    if (!PltDecryptMessage(decryptionCtx, ALGORITHM_AES_GCM,
+                           (unsigned char*)StreamConfig.remoteInputAesKey, sizeof(StreamConfig.remoteInputAesKey),
+                           iv, sizeof(iv),
+                           (unsigned char*)(encPacket + 1), AES_GCM_TAG_LENGTH, // The tag is located right after the header
+                           ((unsigned char*)(encPacket + 1)) + AES_GCM_TAG_LENGTH, plaintextLength, // The ciphertext is after the tag
+                           (unsigned char*)*packet, &plaintextLength)) {
+        free(*packet);
+        return false;
+    }
+
+    // Now we do an in-place V2 to V1 header conversion, so our existing parsing code doesn't have to change.
+    // All we need to do is eliminate the new length field in V2 by shifting everything by 2 bytes.
+    memmove(((unsigned char*)*packet) + 2, ((unsigned char*)*packet) + 4, plaintextLength - 4);
+    *packetLength = plaintextLength - 2;
+
+    return true;
+}
+
 static bool sendMessageEnet(short ptype, short paylen, const void* payload) {
-    PNVCTL_ENET_PACKET_HEADER packet;
     ENetPacket* enetPacket;
     int err;
 
     LC_ASSERT(AppVersionQuad[0] >= 5);
 
-    enetPacket = enet_packet_create(NULL, sizeof(*packet) + paylen, ENET_PACKET_FLAG_RELIABLE);
-    if (enetPacket == NULL) {
-        return false;
-    }
+    if (encryptedControlStream) {
+        PNVCTL_ENCRYPTED_PACKET_HEADER encPacket;
+        PNVCTL_ENET_PACKET_HEADER_V2 packet;
+        char tempBuffer[256];
 
-    packet = (PNVCTL_ENET_PACKET_HEADER)enetPacket->data;
-    packet->type = ptype;
-    memcpy(&packet[1], payload, paylen);
+        enetPacket = enet_packet_create(NULL,
+                                        sizeof(*encPacket) + AES_GCM_TAG_LENGTH + sizeof(*packet) + paylen,
+                                        ENET_PACKET_FLAG_RELIABLE);
+        if (enetPacket == NULL) {
+            return false;
+        }
+
+        // We (ab)use the enetMutex to protect currentEnetSequenceNumber and the cipherContext
+        // used inside encryptControlMessage().
+        PltLockMutex(&enetMutex);
+
+        encPacket = (PNVCTL_ENCRYPTED_PACKET_HEADER)enetPacket->data;
+        encPacket->encryptedHeaderType = 0x0001;
+        encPacket->length = sizeof(encPacket->seq) + AES_GCM_TAG_LENGTH + sizeof(*packet) + paylen;
+        encPacket->seq = currentEnetSequenceNumber++;
+
+        // Construct the plaintext data for encryption
+        LC_ASSERT(sizeof(*packet) + paylen < sizeof(tempBuffer));
+        packet = (PNVCTL_ENET_PACKET_HEADER_V2)tempBuffer;
+        packet->type = ptype;
+        packet->payloadLength = paylen;
+        memcpy(&packet[1], payload, paylen);
+
+        // Encrypt the data into the final packet (and byteswap for BE machines)
+        if (!encryptControlMessage(encPacket, packet)) {
+            Limelog("Failed to encrypt control stream message\n");
+            enet_packet_destroy(enetPacket);
+            PltUnlockMutex(&enetMutex);
+            return false;
+        }
+
+        PltUnlockMutex(&enetMutex);
+    }
+    else {
+        PNVCTL_ENET_PACKET_HEADER_V1 packet;
+        enetPacket = enet_packet_create(NULL, sizeof(*packet) + paylen, ENET_PACKET_FLAG_RELIABLE);
+        if (enetPacket == NULL) {
+            return false;
+        }
+
+        packet = (PNVCTL_ENET_PACKET_HEADER_V1)enetPacket->data;
+        packet->type = LE16(ptype);
+        memcpy(&packet[1], payload, paylen);
+    }
 
     PltLockMutex(&enetMutex);
     err = enet_peer_send(peer, 0, enetPacket);
@@ -390,8 +538,8 @@ static bool sendMessageTcp(short ptype, short paylen, const void* payload) {
         return false;
     }
 
-    packet->type = ptype;
-    packet->payloadLength = paylen;
+    packet->type = LE16(ptype);
+    packet->payloadLength = LE16(paylen);
     memcpy(&packet[1], payload, paylen);
 
     err = send(ctlSock, (char*) packet, sizeof(*packet) + paylen, 0);
@@ -532,7 +680,8 @@ static void controlReceiveThreadFunc(void* context) {
         }
 
         if (event.type == ENET_EVENT_TYPE_RECEIVE) {
-            PNVCTL_ENET_PACKET_HEADER ctlHdr = (PNVCTL_ENET_PACKET_HEADER)event.packet->data;
+            PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr;
+            int packetLength;
 
             if (event.packet->dataLength < sizeof(*ctlHdr)) {
                 Limelog("Discarding runt control packet: %d < %d\n", event.packet->dataLength, (int)sizeof(*ctlHdr));
@@ -540,10 +689,57 @@ static void controlReceiveThreadFunc(void* context) {
                 continue;
             }
 
+            ctlHdr = (PNVCTL_ENET_PACKET_HEADER_V1)event.packet->data;
+            ctlHdr->type = LE16(ctlHdr->type);
+
+            if (encryptedControlStream) {
+                // V2 headers can be interpreted as V1 headers for the purpose of examining type,
+                // so this check is safe.
+                if (ctlHdr->type == 0x0001) {
+                    PNVCTL_ENCRYPTED_PACKET_HEADER encHdr;
+
+                    if (event.packet->dataLength < sizeof(NVCTL_ENCRYPTED_PACKET_HEADER)) {
+                        Limelog("Discarding runt encrypted control packet: %d < %d\n", event.packet->dataLength, (int)sizeof(NVCTL_ENCRYPTED_PACKET_HEADER));
+                        enet_packet_destroy(event.packet);
+                        continue;
+                    }
+
+                    // encryptedHeaderType is already byteswapped by aliasing through ctlHdr above
+                    encHdr = (PNVCTL_ENCRYPTED_PACKET_HEADER)event.packet->data;
+                    encHdr->length = LE16(encHdr->length);
+                    encHdr->seq = LE32(encHdr->seq);
+
+                    ctlHdr = NULL;
+                    if (!decryptControlMessageToV1(encHdr, &ctlHdr, &packetLength)) {
+                        Limelog("Failed to decrypt control packet of size %d\n", event.packet->dataLength);
+                        enet_packet_destroy(event.packet);
+                        continue;
+                    }
+
+                    // We need to byteswap the unsealed header too
+                    ctlHdr->type = LE16(ctlHdr->type);
+                }
+                else {
+                    // What do we do here???
+                    LC_ASSERT(false);
+                    packetLength = event.packet->dataLength;
+                }
+            }
+            else {
+                // Take ownership of the packet data directly for the non-encrypted case
+                packetLength = event.packet->dataLength;
+                event.packet->data = NULL;
+            }
+
+            // We're done with the packet struct
+            enet_packet_destroy(event.packet);
+
+            // All below codepaths must free ctlHdr!!!
+
             if (ctlHdr->type == packetTypes[IDX_RUMBLE_DATA]) {
                 BYTE_BUFFER bb;
 
-                BbInitializeWrappedBuffer(&bb, (char*)event.packet->data, sizeof(*ctlHdr), event.packet->dataLength - sizeof(*ctlHdr), BYTE_ORDER_LITTLE);
+                BbInitializeWrappedBuffer(&bb, (char*)ctlHdr, sizeof(*ctlHdr), packetLength - sizeof(*ctlHdr), BYTE_ORDER_LITTLE);
                 BbAdvanceBuffer(&bb, 4);
 
                 uint16_t controllerNumber;
@@ -559,30 +755,58 @@ static void controlReceiveThreadFunc(void* context) {
             else if (ctlHdr->type == packetTypes[IDX_TERMINATION]) {
                 BYTE_BUFFER bb;
 
-                BbInitializeWrappedBuffer(&bb, (char*)event.packet->data, sizeof(*ctlHdr), event.packet->dataLength - sizeof(*ctlHdr), BYTE_ORDER_LITTLE);
 
-                uint16_t terminationReason;
-                int terminationErrorCode;
+                uint32_t terminationErrorCode;
 
-                BbGet16(&bb, &terminationReason);
+                if (packetLength >= 6) {
+                    // This is the extended termination message which contains a full HRESULT
+                    BbInitializeWrappedBuffer(&bb, (char*)ctlHdr, sizeof(*ctlHdr), packetLength - sizeof(*ctlHdr), BYTE_ORDER_BIG);
+                    BbGet32(&bb, &terminationErrorCode);
 
-                Limelog("Server notified termination reason: 0x%04x\n", terminationReason);
+                    Limelog("Server notified termination reason: 0x%08x\n", terminationErrorCode);
 
-                // SERVER_TERMINATED_INTENDED
-                if (terminationReason == 0x0100) {
-                    if (lastSeenFrame != 0) {
-                        // Pass error code 0 to notify the client that this was not an error
-                        terminationErrorCode = ML_ERROR_GRACEFUL_TERMINATION;
+                    // NVST_DISCONN_SERVER_TERMINATED_CLOSED is the expected graceful termination error
+                    if (terminationErrorCode == 0x80030023) {
+                        if (lastSeenFrame != 0) {
+                            // Pass error code 0 to notify the client that this was not an error
+                            terminationErrorCode = ML_ERROR_GRACEFUL_TERMINATION;
+                        }
+                        else {
+                            // We never saw a frame, so this is probably an error that caused
+                            // NvStreamer to terminate prior to sending any frames.
+                            terminationErrorCode = ML_ERROR_UNEXPECTED_EARLY_TERMINATION;
+                        }
                     }
-                    else {
-                        // We never saw a frame, so this is probably an error that caused
-                        // NvStreamer to terminate prior to sending any frames.
-                        terminationErrorCode = ML_ERROR_UNEXPECTED_EARLY_TERMINATION;
+                    // NVST_DISCONN_SERVER_VFP_PROTECTED_CONTENT means it failed due to protected content on screen
+                    else if (terminationErrorCode == 0x800e9302) {
+                        terminationErrorCode = ML_ERROR_PROTECTED_CONTENT;
                     }
                 }
                 else {
-                    // Otherwise pass the reason unmodified
-                    terminationErrorCode = terminationReason;
+                    uint16_t terminationReason;
+
+                    // This is the short termination message
+                    BbInitializeWrappedBuffer(&bb, (char*)ctlHdr, sizeof(*ctlHdr), packetLength - sizeof(*ctlHdr), BYTE_ORDER_LITTLE);
+                    BbGet16(&bb, &terminationReason);
+
+                    Limelog("Server notified termination reason: 0x%04x\n", terminationReason);
+
+                    // SERVER_TERMINATED_INTENDED
+                    if (terminationReason == 0x0100) {
+                        if (lastSeenFrame != 0) {
+                            // Pass error code 0 to notify the client that this was not an error
+                            terminationErrorCode = ML_ERROR_GRACEFUL_TERMINATION;
+                        }
+                        else {
+                            // We never saw a frame, so this is probably an error that caused
+                            // NvStreamer to terminate prior to sending any frames.
+                            terminationErrorCode = ML_ERROR_UNEXPECTED_EARLY_TERMINATION;
+                        }
+                    }
+                    else {
+                        // Otherwise pass the reason unmodified
+                        terminationErrorCode = terminationReason;
+                    }
                 }
 
                 // We used to wait for a ENET_EVENT_TYPE_DISCONNECT event, but since
@@ -590,12 +814,12 @@ static void controlReceiveThreadFunc(void* context) {
                 // this termination message. The termination message should be reliable
                 // enough to end the stream now, rather than waiting for an explicit
                 // disconnect.
-                ListenerCallbacks.connectionTerminated(terminationErrorCode);
-                enet_packet_destroy(event.packet);
+                ListenerCallbacks.connectionTerminated((int)terminationErrorCode);
+                free(ctlHdr);
                 return;
             }
 
-            enet_packet_destroy(event.packet);
+            free(ctlHdr);
         }
         else if (event.type == ENET_EVENT_TYPE_DISCONNECT) {
             Limelog("Control stream received unexpected disconnect event\n");
@@ -675,11 +899,11 @@ static void requestIdrFrame(void) {
         // Form the payload
         if (lastSeenFrame < 0x20) {
             payload[0] = 0;
-            payload[1] = lastSeenFrame;
+            payload[1] = LE64(lastSeenFrame);
         }
         else {
-            payload[0] = lastSeenFrame - 0x20;
-            payload[1] = lastSeenFrame;
+            payload[0] = LE64(lastSeenFrame - 0x20);
+            payload[1] = LE64(lastSeenFrame);
         }
 
         payload[2] = 0;
@@ -708,6 +932,8 @@ static void requestIdrFrame(void) {
 static void requestInvalidateReferenceFrames(void) {
     int64_t payload[3];
     PQUEUED_FRAME_INVALIDATION_TUPLE qfit;
+    int startFrame;
+    int endFrame;
 
     LC_ASSERT(isReferenceFrameInvalidationEnabled());
 
@@ -717,16 +943,19 @@ static void requestInvalidateReferenceFrames(void) {
 
     LC_ASSERT(qfit->startFrame <= qfit->endFrame);
 
-    payload[0] = qfit->startFrame;
-    payload[1] = qfit->endFrame;
-    payload[2] = 0;
+    startFrame = qfit->startFrame;
+    endFrame = qfit->endFrame;
 
     // Aggregate all lost frames into one range
     do {
-        LC_ASSERT(qfit->endFrame >= payload[1]);
-        payload[1] = qfit->endFrame;
+        LC_ASSERT(qfit->endFrame >= endFrame);
+        endFrame = qfit->endFrame;
         free(qfit);
     } while (getNextFrameInvalidationTuple(&qfit));
+
+    payload[0] = LE64(startFrame);
+    payload[1] = LE64(endFrame);
+    payload[2] = 0;
 
     // Send the reference frame invalidation request and read the response
     if (!sendMessageAndDiscardReply(packetTypes[IDX_INVALIDATE_REF_FRAMES],
@@ -736,7 +965,7 @@ static void requestInvalidateReferenceFrames(void) {
         return;
     }
 
-    Limelog("Invalidate reference frame request sent (%d to %d)\n", (int)payload[0], (int)payload[1]);
+    Limelog("Invalidate reference frame request sent (%d to %d)\n", startFrame, endFrame);
 }
 
 static void invalidateRefFramesFunc(void* context) {

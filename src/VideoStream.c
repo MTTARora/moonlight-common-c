@@ -48,11 +48,11 @@ void destroyVideoStream(void) {
 // UDP Ping proc
 static void UdpPingThreadProc(void* context) {
     char pingData[] = { 0x50, 0x49, 0x4E, 0x47 };
-    struct sockaddr_in6 saddr;
+    LC_SOCKADDR saddr;
     SOCK_RET err;
 
     memcpy(&saddr, &RemoteAddr, sizeof(saddr));
-    saddr.sin6_port = htons(RTP_PORT);
+    SET_PORT(&saddr, RTP_PORT);
 
     while (!PltIsThreadInterrupted(&udpPingThread)) {
         err = sendto(rtpSocket, pingData, sizeof(pingData), 0, (struct sockaddr*)&saddr, RemoteAddrLen);
@@ -142,9 +142,9 @@ static void ReceiveThreadProc(void* context) {
 
         // Convert fields to host byte-order
         packet = (PRTP_PACKET)&buffer[0];
-        packet->sequenceNumber = htons(packet->sequenceNumber);
-        packet->timestamp = htonl(packet->timestamp);
-        packet->ssrc = htonl(packet->ssrc);
+        packet->sequenceNumber = BE16(packet->sequenceNumber);
+        packet->timestamp = BE32(packet->timestamp);
+        packet->ssrc = BE32(packet->ssrc);
 
         queueStatus = RtpfAddPacket(&rtpQueue, packet, err, (PRTPFEC_QUEUE_ENTRY)&buffer[receiveSize]);
 
