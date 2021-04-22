@@ -61,7 +61,7 @@ static void UdpPingThreadProc(void* context) {
 }
 
 // Initialize the audio stream
-void initializeAudioStream(int port) {
+int initializeAudioStream(int port) {
     LbqInitializeLinkedBlockingQueue(&packetQueue, 30);
     RtpqInitializeQueue(&rtpReorderQueue, RTPQ_DEFAULT_MAX_SIZE, RTPQ_DEFAULT_QUEUE_TIME);
     lastSeq = 0;
