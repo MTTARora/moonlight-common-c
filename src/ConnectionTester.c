@@ -158,7 +158,7 @@ unsigned int LiTestClientConnectivity(const char* testServer, unsigned short ref
                 goto Exit;
             }
 
-            SET_PORT((LC_SOCKADDR*)&address, LiGetPortFromPortFlagIndex(i, port1)));
+            SET_PORT((LC_SOCKADDR*)&address, LiGetPortFromPortFlagIndex(i, port1));
             if (LiGetProtocolFromPortFlagIndex(i) == IPPROTO_TCP) {
                 // Initiate an asynchronous connection
                 err = connect(sockets[i], (struct sockaddr*)&address, address_length);
