@@ -874,7 +874,7 @@ int performRtspHandshake(int port1) {
             RTSP_MESSAGE response;
             int error = -1;
 
-            if (!playStream(&response, "streamid=video", &error, port1))) {
+            if (!playStream(&response, "streamid=video", &error, port1)) {
                 Limelog("RTSP PLAY streamid=video request failed: %d\n", error);
                 ret = error;
                 goto Exit;
