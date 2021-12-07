@@ -711,7 +711,7 @@ int performRtspHandshake(int port1) {
         enet_address_set_address(&address, (struct sockaddr *)&RemoteAddr, RemoteAddrLen);
         
         // enet_address_set_port(&address, port1+2);
-        enet_address_set_port(&address, RtspPortNumber, port1+2);
+        enet_address_set_port(&address, RtspPortNumber);
         
         // Create a client that can use 1 outgoing connection and 1 channel
         client = enet_host_create(RemoteAddr.ss_family, NULL, 1, 1, 0, 0);
@@ -841,7 +841,7 @@ int performRtspHandshake(int port1) {
         LC_ASSERT(AudioPortNumber == 0);
         if (!parseServerPortFromTransport(&response, &AudioPortNumber)) {
             // Use the well known port if parsing fails
-            AudioPortNumber = 48000;
+            AudioPortNumber = port1 + 6;
 
             Limelog("Audio port: %u (RTSP parsing failed)\n", AudioPortNumber);
         }
@@ -902,7 +902,7 @@ int performRtspHandshake(int port1) {
         LC_ASSERT(VideoPortNumber == 0);
         if (!parseServerPortFromTransport(&response, &VideoPortNumber)) {
             // Use the well known port if parsing fails
-            VideoPortNumber = 47998;
+            VideoPortNumber = port1+4;
 
             Limelog("Video port: %u (RTSP parsing failed)\n", VideoPortNumber);
         }
@@ -936,7 +936,7 @@ int performRtspHandshake(int port1) {
         LC_ASSERT(ControlPortNumber == 0);
         if (!parseServerPortFromTransport(&response, &ControlPortNumber)) {
             // Use the well known port if parsing fails
-            ControlPortNumber = 47999;
+            ControlPortNumber = port1 + 5;
 
             Limelog("Control port: %u (RTSP parsing failed)\n", ControlPortNumber);
         }

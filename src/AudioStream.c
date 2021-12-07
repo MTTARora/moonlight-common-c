@@ -50,7 +50,7 @@ static void AudioPingThreadProc(void* context) {
     LC_ASSERT(AudioPortNumber != 0);
 
     memcpy(&saddr, &RemoteAddr, sizeof(saddr));
-    SET_PORT(&saddr, AudioPortNumber, port1+5);
+    SET_PORT(&saddr, AudioPortNumber);
 
     // Send PING every 500 milliseconds
     while (!PltIsThreadInterrupted(&udpPingThread)) {

@@ -248,7 +248,7 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     // Parse RTSP port number from RTSP session URL
     if (!parseRtspPortNumberFromUrl(serverInfo->rtspSessionUrl, &RtspPortNumber)) {
         // Use the well known port if parsing fails
-        RtspPortNumber = 48010;
+        RtspPortNumber = port1 + 3;
 
         Limelog("RTSP port: %u (RTSP URL parsing failed)\n", RtspPortNumber);
     }

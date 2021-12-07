@@ -466,8 +466,8 @@ static int fillSdpTail(char* buffer, int port1) {
     return sprintf(buffer,
         "t=0 0\r\n"
         "m=video %d  \r\n",
-        AppVersionQuad[0] < 4 ? 47996 : port1+3);
-        // AppVersionQuad[0] < 4 ? 47996 : VideoPortNumber);
+        // AppVersionQuad[0] < 4 ? 47996 : port1+3);
+        AppVersionQuad[0] < 4 ? 47996 : VideoPortNumber);
 }
 
 // Get the SDP attributes for the stream config

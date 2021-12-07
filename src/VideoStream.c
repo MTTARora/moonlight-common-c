@@ -53,8 +53,8 @@ static void VideoPingThreadProc(void* context) {
     LC_ASSERT(VideoPortNumber != 0);
 
     memcpy(&saddr, &RemoteAddr, sizeof(saddr));
-    SET_PORT(&saddr, port1+3);
-    // SET_PORT(&saddr, VideoPortNumber);
+    // SET_PORT(&saddr, port1+3);
+    SET_PORT(&saddr, VideoPortNumber);
 
     while (!PltIsThreadInterrupted(&udpPingThread)) {
         // We do not check for errors here. Socket errors will be handled
