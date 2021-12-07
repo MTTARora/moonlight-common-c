@@ -7,40 +7,37 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <wlanapi.h>
+#ifndef __MINGW32__
 #include <timeapi.h>
+#else
+#include <mmsystem.h>
+#endif
 #define SetLastSocketError(x) WSASetLastError(x)
 #define LastSocketError() WSAGetLastError()
 
 #define SHUT_RDWR SD_BOTH
-
-// errno.h will include incompatible definitions of these
-// values compared to what Winsock uses, so we must undef
-// them to ensure the correct value is used.
-
-#ifdef EWOULDBLOCK
-#undef EWOULDBLOCK
-#endif
-#define EWOULDBLOCK WSAEWOULDBLOCK
 
 #ifdef EAGAIN
 #undef EAGAIN
 #endif
 #define EAGAIN WSAEWOULDBLOCK
 
-#ifdef EINPROGRESS
-#undef EINPROGRESS
-#endif
-#define EINPROGRESS WSAEINPROGRESS
-
 #ifdef EINTR
 #undef EINTR
 #endif
 #define EINTR WSAEINTR
 
-#ifdef ETIMEDOUT
+#ifdef __MINGW32__
+#undef EWOULDBLOCK
+#undef EINPROGRESS
 #undef ETIMEDOUT
+#undef ECONNREFUSED
 #endif
+
+#define EWOULDBLOCK WSAEWOULDBLOCK
+#define EINPROGRESS WSAEINPROGRESS
 #define ETIMEDOUT WSAETIMEDOUT
+#define ECONNREFUSED WSAECONNREFUSED
 
 typedef int SOCK_RET;
 typedef int SOCKADDR_LEN;
@@ -113,10 +110,10 @@ int setSocketNonBlocking(SOCKET s, bool enabled);
 int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect);
 void shutdownTcpSocket(SOCKET s);
 int setNonFatalRecvTimeoutMs(SOCKET s, int timeoutMs);
-void setRecvTimeout(SOCKET s, int timeoutSec);
 void closeSocket(SOCKET s);
 bool isPrivateNetworkAddress(struct sockaddr_storage* address);
 int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs);
+bool isSocketReadable(SOCKET s);
 
 #define TCP_PORT_MASK 0xFFFF
 #define TCP_PORT_FLAG_ALWAYS_TEST 0x10000

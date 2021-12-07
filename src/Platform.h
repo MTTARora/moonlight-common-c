@@ -1,5 +1,15 @@
 #pragma once
 
+#ifdef _WIN32
+// Prevent bogus definitions of error codes
+// that are incompatible with Winsock errors.
+#define _CRT_NO_POSIX_ERROR_CODES
+
+// Ignore CRT warnings about sprintf(), memcpy(), etc.
+#define _CRT_SECURE_NO_WARNINGS 1
+#define _CRT_NONSTDC_NO_DEPRECATE 1
+#endif
+
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -14,6 +24,15 @@
 #include <sys/time.h>
 #include <netinet/in.h>
 #include <psp2/kernel/threadmgr.h>
+#elif defined(__WIIU__)
+#include <unistd.h>
+#include <sys/time.h>
+#include <netinet/in.h>
+#include <malloc.h>
+#include <coreinit/thread.h>
+#include <coreinit/fastmutex.h>
+#include <coreinit/fastcondition.h>
+#include <fcntl.h>
 #else
 #include <unistd.h>
 #include <pthread.h>
@@ -21,6 +40,7 @@
 #include <sys/ioctl.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <fcntl.h>
 #endif
 
 #ifdef _WIN32

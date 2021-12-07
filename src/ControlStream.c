@@ -1,10 +1,7 @@
 #include "Limelight-internal.h"
-#include "PlatformSockets.h"
-#include "PlatformThreads.h"
 
-#include "ByteBuffer.h"
-
-#include <enet/enet.h>
+// This is a private header, but it just contains some time macros
+#include <enet/time.h>
 
 // NV control stream packet header for TCP
 typedef struct _NVCTL_TCP_PACKET_HEADER {
@@ -44,8 +41,8 @@ static bool usePeriodicPing;
 
 static PLT_THREAD lossStatsThread;
 static PLT_THREAD invalidateRefFramesThread;
+static PLT_THREAD requestIdrFrameThread;
 static PLT_THREAD controlReceiveThread;
-static PLT_EVENT invalidateRefFramesEvent;
 static int lossCountSinceLastReport;
 static int lastGoodFrame;
 static int lastSeenFrame;
@@ -60,8 +57,8 @@ static int lastIntervalLossPercentage;
 static int lastConnectionStatusUpdate;
 static int currentEnetSequenceNumber;
 
-static bool idrFrameRequired;
 static LINKED_BLOCKING_QUEUE invalidReferenceFrameTuples;
+static PLT_EVENT idrFrameRequiredEvent;
 
 static PPLT_CRYPTO_CONTEXT encryptionCtx;
 static PPLT_CRYPTO_CONTEXT decryptionCtx;
@@ -81,6 +78,7 @@ static PPLT_CRYPTO_CONTEXT decryptionCtx;
 #define IDX_TERMINATION 7
 
 #define CONTROL_STREAM_TIMEOUT_SEC 10
+#define CONTROL_STREAM_LINGER_TIMEOUT_SEC 2
 
 static const short packetTypesGen3[] = {
     0x1407, // Request IDR frame
@@ -123,7 +121,7 @@ static const short packetTypesGen7[] = {
     0x0100, // Termination
 };
 static const short packetTypesGen7Enc[] = {
-    0x0305, // Start A
+    0x0302, // Request IDR frame
     0x0307, // Start B
     0x0301, // Invalidate reference frames
     0x0201, // Loss Stats
@@ -141,6 +139,8 @@ static const char startBGen4[] = { 0 };
 
 static const char startAGen5[] = { 0, 0 };
 static const char startBGen5[] = { 0 };
+
+static const char requestIdrFrameGen7Enc[] = { 0, 0 };
 
 static const short payloadLengthsGen3[] = {
     sizeof(requestIdrFrameGen3), // Request IDR frame
@@ -174,6 +174,14 @@ static const short payloadLengthsGen7[] = {
     80, // Frame Stats
     -1, // Input data
 };
+static const short payloadLengthsGen7Enc[] = {
+    sizeof(requestIdrFrameGen7Enc), // Request IDR frame
+    sizeof(startBGen5), // Start B
+    24, // Invalidate reference frames
+    32, // Loss Stats
+    80, // Frame Stats
+    -1, // Input data
+};
 
 static const char* preconstructedPayloadsGen3[] = {
     requestIdrFrameGen3,
@@ -191,10 +199,15 @@ static const char* preconstructedPayloadsGen7[] = {
     startAGen5,
     startBGen5
 };
+static const char* preconstructedPayloadsGen7Enc[] = {
+    requestIdrFrameGen7Enc,
+    startBGen5
+};
 
 static short* packetTypes;
 static short* payloadLengths;
 static char**preconstructedPayloads;
+static bool supportsIdrFrameRequest;
 
 static int port1;
 
@@ -204,7 +217,7 @@ static int port1;
 // Initializes the control stream
 int initializeControlStream(int port) {
     stopping = false;
-    PltCreateEvent(&invalidateRefFramesEvent);
+    PltCreateEvent(&idrFrameRequiredEvent);
     LbqInitializeLinkedBlockingQueue(&invalidReferenceFrameTuples, 20);
     PltCreateMutex(&enetMutex);
     port1 = port;
@@ -215,29 +228,35 @@ int initializeControlStream(int port) {
         packetTypes = (short*)packetTypesGen3;
         payloadLengths = (short*)payloadLengthsGen3;
         preconstructedPayloads = (char**)preconstructedPayloadsGen3;
+        supportsIdrFrameRequest = true;
     }
     else if (AppVersionQuad[0] == 4) {
         packetTypes = (short*)packetTypesGen4;
         payloadLengths = (short*)payloadLengthsGen4;
         preconstructedPayloads = (char**)preconstructedPayloadsGen4;
+        supportsIdrFrameRequest = true;
     }
     else if (AppVersionQuad[0] == 5) {
         packetTypes = (short*)packetTypesGen5;
         payloadLengths = (short*)payloadLengthsGen5;
         preconstructedPayloads = (char**)preconstructedPayloadsGen5;
+        supportsIdrFrameRequest = false;
     }
     else {
         if (encryptedControlStream) {
             packetTypes = (short*)packetTypesGen7Enc;
+            payloadLengths = (short*)payloadLengthsGen7Enc;
+            preconstructedPayloads = (char**)preconstructedPayloadsGen7Enc;
+            supportsIdrFrameRequest = true;
         }
         else {
             packetTypes = (short*)packetTypesGen7;
+            payloadLengths = (short*)payloadLengthsGen7;
+            preconstructedPayloads = (char**)preconstructedPayloadsGen7;
+            supportsIdrFrameRequest = false;
         }
-        payloadLengths = (short*)payloadLengthsGen7;
-        preconstructedPayloads = (char**)preconstructedPayloadsGen7;
     }
 
-    idrFrameRequired = false;
     lastGoodFrame = 0;
     lastSeenFrame = 0;
     lossCountSinceLastReport = 0;
@@ -270,14 +289,9 @@ void destroyControlStream(void) {
     LC_ASSERT(stopping);
     PltDestroyCryptoContext(encryptionCtx);
     PltDestroyCryptoContext(decryptionCtx);
-    PltCloseEvent(&invalidateRefFramesEvent);
+    PltCloseEvent(&idrFrameRequiredEvent);
     freeFrameInvalidationList(LbqDestroyLinkedBlockingQueue(&invalidReferenceFrameTuples));
     PltDeleteMutex(&enetMutex);
-}
-
-int getNextFrameInvalidationTuple(PQUEUED_FRAME_INVALIDATION_TUPLE* qfit) {
-    int err = LbqPollQueueElement(&invalidReferenceFrameTuples, (void**)qfit);
-    return (err == LBQ_SUCCESS);
 }
 
 void queueFrameInvalidationTuple(int startFrame, int endFrame) {
@@ -291,25 +305,28 @@ void queueFrameInvalidationTuple(int startFrame, int endFrame) {
             qfit->endFrame = endFrame;
             if (LbqOfferQueueItem(&invalidReferenceFrameTuples, qfit, &qfit->entry) == LBQ_BOUND_EXCEEDED) {
                 // Too many invalidation tuples, so we need an IDR frame now
+                Limelog("RFI range list reached maximum size limit\n");
                 free(qfit);
-                idrFrameRequired = true;
+                requestIdrOnDemand();
             }
         }
         else {
-            idrFrameRequired = true;
+            requestIdrOnDemand();
         }
     }
     else {
-        idrFrameRequired = true;
+        requestIdrOnDemand();
     }
-
-    PltSetEvent(&invalidateRefFramesEvent);
 }
 
 // Request an IDR frame on demand by the decoder
 void requestIdrOnDemand(void) {
-    idrFrameRequired = true;
-    PltSetEvent(&invalidateRefFramesEvent);
+    // Any reference frame invalidation requests should be dropped now.
+    // We require a full IDR frame to recover.
+    freeFrameInvalidationList(LbqFlushQueueItems(&invalidReferenceFrameTuples));
+
+    // Request the IDR frame
+    PltSetEvent(&idrFrameRequiredEvent);
 }
 
 // Invalidate reference frames lost by the network
@@ -393,8 +410,12 @@ static PNVCTL_TCP_PACKET_HEADER readNvctlPacketTcp(void) {
 }
 
 static bool encryptControlMessage(PNVCTL_ENCRYPTED_PACKET_HEADER encPacket, PNVCTL_ENET_PACKET_HEADER_V2 packet) {
-    unsigned char iv[16];
+    unsigned char iv[16] = { 0 };
     int encryptedSize = sizeof(*packet) + packet->payloadLength;
+
+    // This is a truncating cast, but it's what Nvidia does, so we have to mimic it.
+    // NB: Setting the IV must happen while encPacket->seq is still in native byte-order!
+    iv[0] = (unsigned char)encPacket->seq;
 
     encPacket->encryptedHeaderType = LE16(encPacket->encryptedHeaderType);
     encPacket->length = LE16(encPacket->length);
@@ -403,11 +424,7 @@ static bool encryptControlMessage(PNVCTL_ENCRYPTED_PACKET_HEADER encPacket, PNVC
     packet->type = LE16(packet->type);
     packet->payloadLength = LE16(packet->payloadLength);
 
-    // This is a truncating cast, but it's what Nvidia does, so we have to mimic it.
-    memset(iv, 0, sizeof(iv));
-    iv[0] = (unsigned char)encPacket->seq;
-
-    return PltEncryptMessage(encryptionCtx, ALGORITHM_AES_GCM,
+    return PltEncryptMessage(encryptionCtx, ALGORITHM_AES_GCM, 0,
                              (unsigned char*)StreamConfig.remoteInputAesKey, sizeof(StreamConfig.remoteInputAesKey),
                              iv, sizeof(iv),
                              (unsigned char*)(encPacket + 1), AES_GCM_TAG_LENGTH, // Write tag into the space after the encrypted header
@@ -416,13 +433,21 @@ static bool encryptControlMessage(PNVCTL_ENCRYPTED_PACKET_HEADER encPacket, PNVC
 }
 
 // Caller must free() *packet on success!!!
-static bool decryptControlMessageToV1(PNVCTL_ENCRYPTED_PACKET_HEADER encPacket, PNVCTL_ENET_PACKET_HEADER_V1* packet, int* packetLength) {
-    unsigned char iv[16];
+static bool decryptControlMessageToV1(PNVCTL_ENCRYPTED_PACKET_HEADER encPacket, int encPacketLength, PNVCTL_ENET_PACKET_HEADER_V1* packet, int* packetLength) {
+    unsigned char iv[16] = { 0 };
 
     *packet = NULL;
 
     // It must be an encrypted packet to begin with
     LC_ASSERT(encPacket->encryptedHeaderType == 0x0001);
+
+    // Make sure the host isn't lying to us about the packet length
+    int expectedEncLength = encPacket->length + sizeof(encPacket->encryptedHeaderType) + sizeof(encPacket->length);
+    LC_ASSERT(encPacketLength == expectedEncLength);
+    if (encPacketLength < expectedEncLength) {
+        Limelog("Length exceeds packet boundary (needed %d, got %d)\n", expectedEncLength, encPacketLength);
+        return false;
+    }
 
     // Check length first so we don't underflow
     if (encPacket->length < sizeof(encPacket->seq) + AES_GCM_TAG_LENGTH + sizeof(NVCTL_ENET_PACKET_HEADER_V2)) {
@@ -431,7 +456,6 @@ static bool decryptControlMessageToV1(PNVCTL_ENCRYPTED_PACKET_HEADER encPacket, 
     }
 
     // This is a truncating cast, but it's what Nvidia does, so we have to mimic it.
-    memset(iv, 0, sizeof(iv));
     iv[0] = (unsigned char)encPacket->seq;
 
     int plaintextLength = encPacket->length - sizeof(encPacket->seq) - AES_GCM_TAG_LENGTH;
@@ -440,7 +464,7 @@ static bool decryptControlMessageToV1(PNVCTL_ENCRYPTED_PACKET_HEADER encPacket, 
         return false;
     }
 
-    if (!PltDecryptMessage(decryptionCtx, ALGORITHM_AES_GCM,
+    if (!PltDecryptMessage(decryptionCtx, ALGORITHM_AES_GCM, 0,
                            (unsigned char*)StreamConfig.remoteInputAesKey, sizeof(StreamConfig.remoteInputAesKey),
                            iv, sizeof(iv),
                            (unsigned char*)(encPacket + 1), AES_GCM_TAG_LENGTH, // The tag is located right after the header
@@ -500,7 +524,7 @@ static bool sendMessageEnet(short ptype, short paylen, const void* payload) {
             return false;
         }
 
-        PltUnlockMutex(&enetMutex);
+        // enetMutex still locked here
     }
     else {
         PNVCTL_ENET_PACKET_HEADER_V1 packet;
@@ -512,20 +536,23 @@ static bool sendMessageEnet(short ptype, short paylen, const void* payload) {
         packet = (PNVCTL_ENET_PACKET_HEADER_V1)enetPacket->data;
         packet->type = LE16(ptype);
         memcpy(&packet[1], payload, paylen);
+
+        PltLockMutex(&enetMutex);
     }
 
-    PltLockMutex(&enetMutex);
+    // Queue the packet to be sent
     err = enet_peer_send(peer, 0, enetPacket);
+
+    // Actually send it
+    enet_host_service(client, NULL, 0);
+
     PltUnlockMutex(&enetMutex);
+
     if (err < 0) {
         Limelog("Failed to send ENet control packet\n");
         enet_packet_destroy(enetPacket);
         return false;
     }
-    
-    PltLockMutex(&enetMutex);
-    enet_host_flush(client);
-    PltUnlockMutex(&enetMutex);
 
     return true;
 }
@@ -626,11 +653,32 @@ static void controlReceiveThreadFunc(void* context) {
 
     while (!PltIsThreadInterrupted(&controlReceiveThread)) {
         ENetEvent event;
+        enet_uint32 waitTimeMs;
+
+        PltLockMutex(&enetMutex);
 
         // Poll for new packets and process retransmissions
-        PltLockMutex(&enetMutex);
         err = serviceEnetHost(client, &event, 0);
+
+        // Compute the next time we need to wake up to handle
+        // the RTO timer or a ping.
+        if (err == 0) {
+            if (ENET_TIME_LESS(peer->nextTimeout, client->serviceTime)) {
+                // This can happen when we have no unacked reliable messages
+                waitTimeMs = 10;
+            }
+            else {
+                // We add 1 ms just to ensure we're unlikely to undershoot the sleep() and have to
+                // do a tiny sleep for another iteration before the timeout is ready to be serviced.
+                waitTimeMs = ENET_TIME_DIFFERENCE(peer->nextTimeout, client->serviceTime) + 1;
+                if (waitTimeMs > peer->pingInterval) {
+                    waitTimeMs = peer->pingInterval;
+                }
+            }
+        }
+
         PltUnlockMutex(&enetMutex);
+
         if (err == 0) {
             // Handle a pending disconnect after unsuccessfully polling
             // for new events to handle.
@@ -666,12 +714,9 @@ static void controlReceiveThreadFunc(void* context) {
                 }
             }
             else {
-                // No events ready - sleep for a short time
-                //
-                // NOTE: This sleep *directly* impacts the lowest possible retransmission
-                // time for packets after a loss event. If we're busy sleeping here, we can't
-                // retransmit a dropped packet, so we keep the sleep time to a minimum.
-                PltSleepMsInterruptible(&controlReceiveThread, 10);
+                // No events ready - wait for readability or a local RTO timer to expire
+                enet_uint32 condition = ENET_SOCKET_WAIT_RECEIVE;
+                enet_socket_wait(client->socket, &condition, waitTimeMs);
                 continue;
             }
         }
@@ -713,7 +758,8 @@ static void controlReceiveThreadFunc(void* context) {
                     encHdr->seq = LE32(encHdr->seq);
 
                     ctlHdr = NULL;
-                    if (!decryptControlMessageToV1(encHdr, &ctlHdr, &packetLength)) {
+                    packetLength = (int)event.packet->dataLength;
+                    if (!decryptControlMessageToV1(encHdr, packetLength, &ctlHdr, &packetLength)) {
                         Limelog("Failed to decrypt control packet of size %d\n", event.packet->dataLength);
                         enet_packet_destroy(event.packet);
                         continue;
@@ -725,12 +771,13 @@ static void controlReceiveThreadFunc(void* context) {
                 else {
                     // What do we do here???
                     LC_ASSERT(false);
-                    packetLength = event.packet->dataLength;
+                    packetLength = (int)event.packet->dataLength;
+                    event.packet->data = NULL;
                 }
             }
             else {
                 // Take ownership of the packet data directly for the non-encrypted case
-                packetLength = event.packet->dataLength;
+                packetLength = (int)event.packet->dataLength;
                 event.packet->data = NULL;
             }
 
@@ -816,7 +863,13 @@ static void controlReceiveThreadFunc(void* context) {
                 // GFE 3.20.3.63 we don't get one for 10 seconds after we first get
                 // this termination message. The termination message should be reliable
                 // enough to end the stream now, rather than waiting for an explicit
-                // disconnect.
+                // disconnect. The server will also not acknowledge our disconnect
+                // message once it sends this message, so we mark the peer as fully
+                // disconnected now to avoid delays waiting for an ack that will
+                // never arrive.
+                PltLockMutex(&enetMutex);
+                enet_peer_disconnect_now(peer, 0);
+                PltUnlockMutex(&enetMutex);
                 ListenerCallbacks.connectionTerminated((int)terminationErrorCode);
                 free(ctlHdr);
                 return;
@@ -896,9 +949,12 @@ static void lossStatsThreadFunc(void* context) {
 }
 
 static void requestIdrFrame(void) {
-    int64_t payload[3];
+    // If this server does not have a known IDR frame request
+    // message, we'll accomplish the same thing by creating a
+    // reference frame invalidation request.
+    if (!supportsIdrFrameRequest) {
+        int64_t payload[3];
 
-    if (AppVersionQuad[0] >= 5) {
         // Form the payload
         if (lastSeenFrame < 0x20) {
             payload[0] = 0;
@@ -932,29 +988,11 @@ static void requestIdrFrame(void) {
     Limelog("IDR frame request sent\n");
 }
 
-static void requestInvalidateReferenceFrames(void) {
+static void requestInvalidateReferenceFrames(int startFrame, int endFrame) {
     int64_t payload[3];
-    PQUEUED_FRAME_INVALIDATION_TUPLE qfit;
-    int startFrame;
-    int endFrame;
 
+    LC_ASSERT(startFrame <= endFrame);
     LC_ASSERT(isReferenceFrameInvalidationEnabled());
-
-    if (!getNextFrameInvalidationTuple(&qfit)) {
-        return;
-    }
-
-    LC_ASSERT(qfit->startFrame <= qfit->endFrame);
-
-    startFrame = qfit->startFrame;
-    endFrame = qfit->endFrame;
-
-    // Aggregate all lost frames into one range
-    do {
-        LC_ASSERT(qfit->endFrame >= endFrame);
-        endFrame = qfit->endFrame;
-        free(qfit);
-    } while (getNextFrameInvalidationTuple(&qfit));
 
     payload[0] = LE64(startFrame);
     payload[1] = LE64(endFrame);
@@ -972,32 +1010,49 @@ static void requestInvalidateReferenceFrames(void) {
 }
 
 static void invalidateRefFramesFunc(void* context) {
+    LC_ASSERT(isReferenceFrameInvalidationEnabled());
+
     while (!PltIsThreadInterrupted(&invalidateRefFramesThread)) {
-        // Wait for a request to invalidate reference frames
-        PltWaitForEvent(&invalidateRefFramesEvent);
-        PltClearEvent(&invalidateRefFramesEvent);
-        
-        // Bail if we've been shutdown
+        PQUEUED_FRAME_INVALIDATION_TUPLE qfit;
+        int startFrame;
+        int endFrame;
+
+        // Wait for a reference frame invalidation request or a request to shutdown
+        if (LbqWaitForQueueElement(&invalidReferenceFrameTuples, (void**)&qfit) != LBQ_SUCCESS) {
+            // Bail if we're stopping
+            return;
+        }
+
+        startFrame = qfit->startFrame;
+        endFrame = qfit->endFrame;
+
+        // Aggregate all lost frames into one range
+        do {
+            LC_ASSERT(qfit->endFrame >= endFrame);
+            endFrame = qfit->endFrame;
+            free(qfit);
+        } while (LbqPollQueueElement(&invalidReferenceFrameTuples, (void**)&qfit) == LBQ_SUCCESS);
+
+        // Send the reference frame invalidation request
+        requestInvalidateReferenceFrames(startFrame, endFrame);
+    }
+}
+
+static void requestIdrFrameFunc(void* context) {
+    while (!PltIsThreadInterrupted(&requestIdrFrameThread)) {
+        PltWaitForEvent(&idrFrameRequiredEvent);
+        PltClearEvent(&idrFrameRequiredEvent);
+
         if (stopping) {
-            break;
+            // Bail if we're stopping
+            return;
         }
 
-        // Sometimes we absolutely need an IDR frame
-        if (idrFrameRequired) {
-            // Empty invalidate reference frames tuples
-            PQUEUED_FRAME_INVALIDATION_TUPLE qfit;
-            while (getNextFrameInvalidationTuple(&qfit)) {
-                free(qfit);
-            }
+        // Any pending reference frame invalidation requests are now redundant
+        freeFrameInvalidationList(LbqFlushQueueItems(&invalidReferenceFrameTuples));
 
-            // Send an IDR frame request
-            idrFrameRequired = false;
-            requestIdrFrame();
-        }
-        else {
-            // Otherwise invalidate reference frames
-            requestInvalidateReferenceFrames();
-        }
+        // Request the IDR frame
+        requestIdrFrame();
     }
 }
 
@@ -1005,7 +1060,7 @@ static void invalidateRefFramesFunc(void* context) {
 int stopControlStream(void) {
     stopping = true;
     LbqSignalQueueShutdown(&invalidReferenceFrameTuples);
-    PltSetEvent(&invalidateRefFramesEvent);
+    PltSetEvent(&idrFrameRequiredEvent);
 
     // This must be set to stop in a timely manner
     LC_ASSERT(ConnectionInterrupted);
@@ -1015,21 +1070,28 @@ int stopControlStream(void) {
     }
     
     PltInterruptThread(&lossStatsThread);
-    PltInterruptThread(&invalidateRefFramesThread);
+    PltInterruptThread(&requestIdrFrameThread);
     PltInterruptThread(&controlReceiveThread);
 
     PltJoinThread(&lossStatsThread);
-    PltJoinThread(&invalidateRefFramesThread);
+    PltJoinThread(&requestIdrFrameThread);
     PltJoinThread(&controlReceiveThread);
 
     PltCloseThread(&lossStatsThread);
-    PltCloseThread(&invalidateRefFramesThread);
+    PltCloseThread(&requestIdrFrameThread);
     PltCloseThread(&controlReceiveThread);
 
+    // We will only have an RFI thread if RFI is enabled
+    if (isReferenceFrameInvalidationEnabled()) {
+        PltInterruptThread(&invalidateRefFramesThread);
+        PltJoinThread(&invalidateRefFramesThread);
+        PltCloseThread(&invalidateRefFramesThread);
+    }
+
     if (peer != NULL) {
-        // We use enet_peer_disconnect_now() so the host knows immediately
-        // of our termination and can cleanup properly for reconnection.
-        enet_peer_disconnect_now(peer, 0);
+        // Gracefully disconnect to ensure the remote host receives all of our final
+        // outbound traffic, including any key up events that might be sent.
+        gracefullyDisconnectEnetPeer(client, peer, CONTROL_STREAM_LINGER_TIMEOUT_SEC * 1000);
         peer = NULL;
     }
     if (client != NULL) {
@@ -1057,6 +1119,26 @@ int sendInputPacketOnControlStream(unsigned char* data, int length) {
     return 0;
 }
 
+bool LiGetEstimatedRttInfo(uint32_t* estimatedRtt, uint32_t* estimatedRttVariance) {
+    bool ret = false;
+
+    PltLockMutex(&enetMutex);
+    if (peer != NULL && peer->state == ENET_PEER_STATE_CONNECTED) {
+        if (estimatedRtt != NULL) {
+            *estimatedRtt = peer->roundTripTime;
+        }
+
+        if (estimatedRttVariance != NULL) {
+            *estimatedRttVariance = peer->roundTripTimeVariance;
+        }
+
+        ret = true;
+    }
+    PltUnlockMutex(&enetMutex);
+
+    return ret;
+}
+
 // Starts the control stream
 int startControlStream(void) {
     int err;
@@ -1065,8 +1147,10 @@ int startControlStream(void) {
         ENetAddress address;
         ENetEvent event;
         
+        LC_ASSERT(ControlPortNumber != 0);
+
         enet_address_set_address(&address, (struct sockaddr *)&RemoteAddr, RemoteAddrLen);
-        enet_address_set_port(&address, port1+4);
+        enet_address_set_port(&address, ControlPortNumber, port1+4);
 
         // Create a client that can use 1 outgoing connection and 1 channel
         client = enet_host_create(address.address.ss_family, NULL, 1, 1, 0, 0);
@@ -1089,7 +1173,7 @@ int startControlStream(void) {
         // Wait for the connect to complete
         if (serviceEnetHost(client, &event, CONTROL_STREAM_TIMEOUT_SEC * 1000) <= 0 ||
             event.type != ENET_EVENT_TYPE_CONNECT) {
-            Limelog("Failed to connect to UDP port 47999\n");
+            Limelog("Failed to connect to UDP port %u\n", ControlPortNumber);
             stopping = true;
             enet_peer_reset(peer);
             peer = NULL;
@@ -1101,10 +1185,12 @@ int startControlStream(void) {
         // Ensure the connect verify ACK is sent immediately
         enet_host_flush(client);
         
-        // Set the max peer timeout to 10 seconds
-        enet_peer_timeout(peer, ENET_PEER_TIMEOUT_LIMIT, ENET_PEER_TIMEOUT_MINIMUM, 10000);
+        // Set the peer timeout to 10 seconds and limit backoff to 2x RTT
+        enet_peer_timeout(peer, 2, 10000, 10000);
     }
     else {
+        // NB: Do NOT use ControlPortNumber here. 47995 is correct for these old versions.
+        LC_ASSERT(ControlPortNumber == 0);
         ctlSock = connectTcpSocket(&RemoteAddr, RemoteAddrLen,
             47995, CONTROL_STREAM_TIMEOUT_SEC);
         if (ctlSock == INVALID_SOCKET) {
@@ -1223,7 +1309,7 @@ int startControlStream(void) {
         return err;
     }
 
-    err = PltCreateThread("InvRefFrames", invalidateRefFramesFunc, NULL, &invalidateRefFramesThread);
+    err = PltCreateThread("ReqIdrFrame", requestIdrFrameFunc, NULL, &requestIdrFrameThread);
     if (err != 0) {
         stopping = true;
 
@@ -1254,6 +1340,47 @@ int startControlStream(void) {
         }
 
         return err;
+    }
+
+    // Only create the reference frame invalidation thread if RFI is enabled
+    if (isReferenceFrameInvalidationEnabled()) {
+        err = PltCreateThread("InvRefFrames", invalidateRefFramesFunc, NULL, &invalidateRefFramesThread);
+        if (err != 0) {
+            stopping = true;
+            PltSetEvent(&idrFrameRequiredEvent);
+
+            if (ctlSock != INVALID_SOCKET) {
+                shutdownTcpSocket(ctlSock);
+            }
+            else {
+                ConnectionInterrupted = true;
+            }
+
+            PltInterruptThread(&lossStatsThread);
+            PltJoinThread(&lossStatsThread);
+            PltCloseThread(&lossStatsThread);
+
+            PltInterruptThread(&controlReceiveThread);
+            PltJoinThread(&controlReceiveThread);
+            PltCloseThread(&controlReceiveThread);
+
+            PltInterruptThread(&requestIdrFrameThread);
+            PltJoinThread(&requestIdrFrameThread);
+            PltCloseThread(&requestIdrFrameThread);
+
+            if (ctlSock != INVALID_SOCKET) {
+                closeSocket(ctlSock);
+                ctlSock = INVALID_SOCKET;
+            }
+            else {
+                enet_peer_disconnect_now(peer, 0);
+                peer = NULL;
+                enet_host_destroy(client);
+                client = NULL;
+            }
+
+            return err;
+        }
     }
 
     return 0;

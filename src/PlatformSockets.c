@@ -1,4 +1,3 @@
-#include "PlatformSockets.h"
 #include "Limelight-internal.h"
 
 #define TEST_PORT_TIMEOUT_SEC 3
@@ -10,6 +9,11 @@
 #define TCPv6_MSS 1220
 
 #if defined(LC_WINDOWS)
+
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
+
 static HMODULE WlanApiLibraryHandle;
 static HANDLE WlanHandle;
 
@@ -18,6 +22,10 @@ DWORD (WINAPI *pfnWlanCloseHandle)(HANDLE hClientHandle, PVOID pReserved);
 DWORD (WINAPI *pfnWlanEnumInterfaces)(HANDLE hClientHandle, PVOID pReserved, PWLAN_INTERFACE_INFO_LIST *ppInterfaceList);
 VOID (WINAPI *pfnWlanFreeMemory)(PVOID pMemory);
 DWORD (WINAPI *pfnWlanSetInterface)(HANDLE hClientHandle, CONST GUID *pInterfaceGuid, WLAN_INTF_OPCODE OpCode, DWORD dwDataSize, CONST PVOID pData, PVOID pReserved);
+
+#ifndef WLAN_API_MAKE_VERSION
+#define WLAN_API_MAKE_VERSION(_major, _minor)   (((DWORD)(_minor)) << 16 | (_major))
+#endif
 
 #endif
 
@@ -52,9 +60,16 @@ void shutdownTcpSocket(SOCKET s) {
 
 int setNonFatalRecvTimeoutMs(SOCKET s, int timeoutMs) {
 #if defined(LC_WINDOWS)
-    // Windows says that SO_RCVTIMEO puts the socket
-    // into an indeterminate state, so we won't use
-    // it for non-fatal socket operations.
+    // Windows says that SO_RCVTIMEO puts the socket into an indeterminate state
+    // when a timeout occurs. MSDN doesn't go into it any more than that, but it
+    // seems likely that they are referring to the inability to know whether a
+    // cancelled request consumed some data or not (very relevant for stream-based
+    // protocols like TCP). Since our sockets are UDP which is already unreliable,
+    // losing some data in a very rare case is fine, especially because we get to
+    // halve the number of syscalls per packet by avoiding select().
+    return setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeoutMs, sizeof(timeoutMs));
+#elif defined(__WIIU__)
+    // timeouts aren't supported on Wii U
     return -1;
 #else
     struct timeval val;
@@ -64,20 +79,6 @@ int setNonFatalRecvTimeoutMs(SOCKET s, int timeoutMs) {
 
     return setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&val, sizeof(val));
 #endif
-}
-
-void setRecvTimeout(SOCKET s, int timeoutSec) {
-#if defined(LC_WINDOWS)
-    int val = timeoutSec * 1000;
-#else
-    struct timeval val;
-    val.tv_sec = timeoutSec;
-    val.tv_usec = 0;
-#endif
-    
-    if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&val, sizeof(val)) < 0) {
-        Limelog("setsockopt(SO_RCVTIMEO) failed: %d\n", (int)LastSocketError());
-    }
 }
 
 int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs) {
@@ -150,6 +151,20 @@ int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs) {
 #endif
 }
 
+bool isSocketReadable(SOCKET s) {
+    struct pollfd pfd;
+    int err;
+
+    pfd.fd = s;
+    pfd.events = POLLIN;
+    err = pollSockets(&pfd, 1, 0);
+    if (err <= 0) {
+        return false;
+    }
+
+    return true;
+}
+
 int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect) {
     int err;
     
@@ -177,7 +192,8 @@ int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect) {
             if (err < 0 &&
                     (LastSocketError() == EWOULDBLOCK ||
                      LastSocketError() == EINTR ||
-                     LastSocketError() == EAGAIN)) {
+                     LastSocketError() == EAGAIN ||
+                     LastSocketError() == ETIMEDOUT)) {
                 // Return 0 for timeout
                 return 0;
             }
@@ -232,11 +248,20 @@ SOCKET bindUdpSocket(int addrfamily, int bufferSize) {
         return INVALID_SOCKET;
     }
 
-#ifdef LC_DARWIN
+#if defined(LC_DARWIN)
     {
         // Disable SIGPIPE on iOS
         int val = 1;
         setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, (char*)&val, sizeof(val));
+    }
+#elif defined(LC_WINDOWS)
+    {
+        // Disable WSAECONNRESET for UDP sockets on Windows
+        BOOL val = FALSE;
+        DWORD bytesReturned = 0;
+        if (WSAIoctl(s, SIO_UDP_CONNRESET, &val, sizeof(val), NULL, 0, &bytesReturned, NULL, NULL) != 0) {
+            Limelog("WSAIoctl(SIO_UDP_CONNRESET) failed: %d\n", LastSocketError());
+        }
     }
 #endif
 
@@ -278,11 +303,17 @@ int setSocketNonBlocking(SOCKET s, bool enabled) {
 #if defined(__vita__)
     int val = enabled ? 1 : 0;
     return setsockopt(s, SOL_SOCKET, SO_NONBLOCK, (char*)&val, sizeof(val));
+#elif defined(O_NONBLOCK)
+    return fcntl(s, F_SETFL, (enabled ? O_NONBLOCK : 0) | (fcntl(s, F_GETFL) & ~O_NONBLOCK));
 #elif defined(FIONBIO)
+#ifdef LC_WINDOWS
+    u_long val = enabled ? 1 : 0;
+#else
     int val = enabled ? 1 : 0;
+#endif
     return ioctlsocket(s, FIONBIO, &val);
 #else
-    return SOCKET_ERROR;
+#error Please define your platform non-blocking sockets API!
 #endif
 }
 
@@ -477,7 +508,7 @@ int resolveHostName(const char* host, int family, int tcpTestPort, struct sockad
         // b) The caller asked us to test even with a single address
         if (tcpTestPort != 0 && (res->ai_next != NULL || (tcpTestPort & TCP_PORT_FLAG_ALWAYS_TEST))) {
             SOCKET testSocket = connectTcpSocket((struct sockaddr_storage*)currentAddr->ai_addr,
-                                                 currentAddr->ai_addrlen,
+                                                 (SOCKADDR_LEN)currentAddr->ai_addrlen,
                                                  tcpTestPort & TCP_PORT_MASK,
                                                  TEST_PORT_TIMEOUT_SEC);
             if (testSocket == INVALID_SOCKET) {
@@ -490,7 +521,7 @@ int resolveHostName(const char* host, int family, int tcpTestPort, struct sockad
         }
         
         memcpy(addr, currentAddr->ai_addr, currentAddr->ai_addrlen);
-        *addrLen = currentAddr->ai_addrlen;
+        *addrLen = (SOCKADDR_LEN)currentAddr->ai_addrlen;
         
         freeaddrinfo(res);
         return 0;
@@ -584,11 +615,11 @@ void enterLowLatencyMode(void) {
         return;
     }
 
-    pfnWlanOpenHandle = GetProcAddress(WlanApiLibraryHandle, "WlanOpenHandle");
-    pfnWlanCloseHandle = GetProcAddress(WlanApiLibraryHandle, "WlanCloseHandle");
-    pfnWlanFreeMemory = GetProcAddress(WlanApiLibraryHandle, "WlanFreeMemory");
-    pfnWlanEnumInterfaces = GetProcAddress(WlanApiLibraryHandle, "WlanEnumInterfaces");
-    pfnWlanSetInterface = GetProcAddress(WlanApiLibraryHandle, "WlanSetInterface");
+    pfnWlanOpenHandle = (void*)GetProcAddress(WlanApiLibraryHandle, "WlanOpenHandle");
+    pfnWlanCloseHandle = (void*)GetProcAddress(WlanApiLibraryHandle, "WlanCloseHandle");
+    pfnWlanFreeMemory = (void*)GetProcAddress(WlanApiLibraryHandle, "WlanFreeMemory");
+    pfnWlanEnumInterfaces = (void*)GetProcAddress(WlanApiLibraryHandle, "WlanEnumInterfaces");
+    pfnWlanSetInterface = (void*)GetProcAddress(WlanApiLibraryHandle, "WlanSetInterface");
 
     if (pfnWlanOpenHandle == NULL || pfnWlanCloseHandle == NULL ||
             pfnWlanFreeMemory == NULL || pfnWlanEnumInterfaces == NULL || pfnWlanSetInterface == NULL) {
@@ -672,7 +703,7 @@ int initializePlatformSockets(void) {
 #if defined(LC_WINDOWS)
     WSADATA data;
     return WSAStartup(MAKEWORD(2, 0), &data);
-#elif defined(__vita__)
+#elif defined(__vita__) || defined(__WIIU__)
     return 0; // already initialized
 #elif defined(LC_POSIX) && !defined(LC_CHROME)
     // Disable SIGPIPE signals to avoid us getting

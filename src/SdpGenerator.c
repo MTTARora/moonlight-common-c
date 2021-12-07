@@ -133,35 +133,48 @@ static int addGen4Options(PSDP_OPTION* head, char* addrStr) {
     char payloadStr[92];
     int err = 0;
 
-    sprintf(payloadStr, "rtsp://%s:48010", addrStr);
+    LC_ASSERT(RtspPortNumber != 0);
+    sprintf(payloadStr, "rtsp://%s:%u", addrStr, RtspPortNumber);
     err |= addAttributeString(head, "x-nv-general.serverAddress", payloadStr);
 
     return err;
 }
 
+#define NVFF_BASE             0x07
+#define NVFF_AUDIO_ENCRYPTION 0x20
+#define NVFF_RI_ENCRYPTION    0x80
+
 static int addGen5Options(PSDP_OPTION* head) {
     int err = 0;
+    char payloadStr[32];
+
+    // This must be initialized to false already
+    LC_ASSERT(!AudioEncryptionEnabled);
 
     if (APP_VERSION_AT_LEAST(7, 1, 431)) {
-        // 0x20 enables audio encryption (which we don't support yet)
-        // 0x80 enables remote input encryption (which we do want)
-        err |= addAttributeString(head, "x-nv-general.featureFlags", "135");
+        unsigned int featureFlags;
+
+        // RI encryption is always enabled
+        featureFlags = NVFF_BASE | NVFF_RI_ENCRYPTION;
+
+        // Enable audio encryption if the client opted in
+        if (StreamConfig.encryptionFlags & ENCFLG_AUDIO) {
+            featureFlags |= NVFF_AUDIO_ENCRYPTION;
+            AudioEncryptionEnabled = true;
+        }
+
+        sprintf(payloadStr, "%u", featureFlags);
+        err |= addAttributeString(head, "x-nv-general.featureFlags", payloadStr);
 
         // Ask for the encrypted control protocol to ensure remote input will be encrypted.
         // This used to be done via separate RI encryption, but now it is all or nothing.
         err |= addAttributeString(head, "x-nv-general.useReliableUdp", "13");
 
-        if (StreamConfig.bitrate >= 30000 || StreamConfig.width * StreamConfig.height >= 3840 * 2160) {
-            // HACK: GFE 3.22 will split frames into 2 FEC blocks (sharing a frame number)
-            // if the number of packets exceeds ~120. We can't correctly handle those, so
-            // we'll turn off FEC at bitrates above 30 Mbps as an interim hack.
-            err |= addAttributeString(head, "x-nv-vqos[0].fec.repairPercent", "0");
-            err |= addAttributeString(head, "x-nv-vqos[0].fec.numSrcPackets", "511");
-        }
-        else {
-            err |= addAttributeString(head, "x-nv-vqos[0].fec.repairPercent", "20");
-            err |= addAttributeString(head, "x-nv-vqos[0].fec.numSrcPackets", "125");
-        }
+        // Require at least 2 FEC packets for small frames. If a frame has fewer data shards
+        // than would generate 2 FEC shards, it will increase the FEC percentage for that frame
+        // above the set value (even going as high as 200% FEC to generate 2 FEC shards from a
+        // 1 data shard frame).
+        err |= addAttributeString(head, "x-nv-vqos[0].fec.minRequiredFecPackets", "2");
     }
     else {
         // We want to use the new ENet connections for control and input
@@ -400,13 +413,10 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
             err |= addAttributeString(&optionHead, "x-nv-audio.surround.AudioQuality", "0");
             HighQualitySurroundEnabled = false;
 
-            if ((AudioCallbacks.capabilities & CAPABILITY_SLOW_OPUS_DECODER) != 0) {
-                // Use 20 ms packets for slow decoders to save CPU time
-                AudioPacketDuration = 20;
-            }
-            else if ((AudioCallbacks.capabilities & CAPABILITY_SUPPORTS_ARBITRARY_AUDIO_DURATION) != 0 &&
-                      OriginalVideoBitrate < LOW_AUDIO_BITRATE_TRESHOLD) {
-                // Use 10 ms packets for slow networks to balance latency and bandwidth usage
+            if ((AudioCallbacks.capabilities & CAPABILITY_SLOW_OPUS_DECODER) ||
+                     ((AudioCallbacks.capabilities & CAPABILITY_SUPPORTS_ARBITRARY_AUDIO_DURATION) != 0 &&
+                       OriginalVideoBitrate < LOW_AUDIO_BITRATE_TRESHOLD)) {
+                // Use 10 ms packets for slow devices and networks to balance latency and bandwidth usage
                 AudioPacketDuration = 10;
             }
             else {
@@ -452,10 +462,12 @@ static int fillSdpHeader(char* buffer, int rtspClientVersion, char*urlSafeAddr) 
 
 // Populate the SDP tail with required information
 static int fillSdpTail(char* buffer, int port1) {
+    LC_ASSERT(VideoPortNumber != 0);
     return sprintf(buffer,
         "t=0 0\r\n"
         "m=video %d  \r\n",
         AppVersionQuad[0] < 4 ? 47996 : port1+3);
+        // AppVersionQuad[0] < 4 ? 47996 : VideoPortNumber);
 }
 
 // Get the SDP attributes for the stream config

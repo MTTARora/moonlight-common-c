@@ -1,7 +1,4 @@
-#include "Platform.h"
 #include "Limelight-internal.h"
-#include "LinkedBlockingQueue.h"
-#include "Video.h"
 
 static PLENTRY nalChainHead;
 static PLENTRY nalChainTail;
@@ -40,6 +37,7 @@ typedef struct _LENTRY_INTERNAL {
 #define H264_NAL_TYPE(x) ((x) & 0x1F)
 #define HEVC_NAL_TYPE(x) (((x) & 0x7E) >> 1)
 
+#define H264_NAL_TYPE_SEI 6
 #define H264_NAL_TYPE_SPS 7
 #define H264_NAL_TYPE_PPS 8
 #define H264_NAL_TYPE_AUD 9
@@ -47,6 +45,7 @@ typedef struct _LENTRY_INTERNAL {
 #define HEVC_NAL_TYPE_SPS 33
 #define HEVC_NAL_TYPE_PPS 34
 #define HEVC_NAL_TYPE_AUD 35
+#define HEVC_NAL_TYPE_SEI 39
 
 // Init
 void initializeVideoDepacketizer(int pktSize) {
@@ -120,7 +119,7 @@ static void freeDecodeUnitList(PLINKED_BLOCKING_QUEUE_ENTRY entry) {
         nextEntry = entry->flink;
 
         // Complete this with a failure status
-        completeQueuedDecodeUnit((PQUEUED_DECODE_UNIT)entry->data, DR_CLEANUP);
+        LiCompleteVideoFrame(entry->data, DR_CLEANUP);
 
         entry = nextEntry;
     }
@@ -184,15 +183,52 @@ static bool getSpecialSeq(PBUFFER_DESC current, PBUFFER_DESC candidate) {
     return false;
 }
 
-// Get the first decode unit available
-bool getNextQueuedDecodeUnit(PQUEUED_DECODE_UNIT* qdu) {
-    int err = LbqWaitForQueueElement(&decodeUnitQueue, (void**)qdu);
-    return (err == LBQ_SUCCESS);
+bool LiWaitForNextVideoFrame(VIDEO_FRAME_HANDLE* frameHandle, PDECODE_UNIT* decodeUnit) {
+    PQUEUED_DECODE_UNIT qdu;
+
+    int err = LbqWaitForQueueElement(&decodeUnitQueue, (void**)&qdu);
+    if (err != LBQ_SUCCESS) {
+        return false;
+    }
+
+    *frameHandle = qdu;
+    *decodeUnit = &qdu->decodeUnit;
+    return true;
+}
+
+bool LiPollNextVideoFrame(VIDEO_FRAME_HANDLE* frameHandle, PDECODE_UNIT* decodeUnit) {
+    PQUEUED_DECODE_UNIT qdu;
+
+    int err = LbqPollQueueElement(&decodeUnitQueue, (void**)&qdu);
+    if (err != LBQ_SUCCESS) {
+        return false;
+    }
+
+    *frameHandle = qdu;
+    *decodeUnit = &qdu->decodeUnit;
+    return true;
+}
+
+bool LiPeekNextVideoFrame(PDECODE_UNIT* decodeUnit) {
+    PQUEUED_DECODE_UNIT qdu;
+
+    int err = LbqPeekQueueElement(&decodeUnitQueue, (void**)&qdu);
+    if (err != LBQ_SUCCESS) {
+        return false;
+    }
+
+    *decodeUnit = &qdu->decodeUnit;
+    return true;
 }
 
 // Cleanup a decode unit by freeing the buffer chain and the holder
-void completeQueuedDecodeUnit(PQUEUED_DECODE_UNIT qdu, int drStatus) {
+void LiCompleteVideoFrame(VIDEO_FRAME_HANDLE handle, int drStatus) {
+    PQUEUED_DECODE_UNIT qdu = handle;
     PLENTRY_INTERNAL lastEntry;
+
+    if (qdu->decodeUnit.frameType == FRAME_TYPE_IDR) {
+        notifyKeyFrameReceived();
+    }
 
     if (drStatus == DR_NEED_IDR) {
         Limelog("Requesting IDR frame on behalf of DR\n");
@@ -252,6 +288,25 @@ static bool isAccessUnitDelimiter(PBUFFER_DESC buffer) {
     }
     else if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_H265) {
         return HEVC_NAL_TYPE(specialSeq.data[specialSeq.offset + specialSeq.length]) == HEVC_NAL_TYPE_AUD;
+    }
+    else {
+        LC_ASSERT(false);
+        return false;
+    }
+}
+
+static bool isSeiNal(PBUFFER_DESC buffer) {
+    BUFFER_DESC specialSeq;
+
+    if (!getSpecialSeq(buffer, &specialSeq)) {
+        return false;
+    }
+
+    if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_H264) {
+        return H264_NAL_TYPE(specialSeq.data[specialSeq.offset + specialSeq.length]) == H264_NAL_TYPE_SEI;
+    }
+    else if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_H265) {
+        return HEVC_NAL_TYPE(specialSeq.data[specialSeq.offset + specialSeq.length]) == HEVC_NAL_TYPE_SEI;
     }
     else {
         LC_ASSERT(false);
@@ -356,7 +411,7 @@ static void reassembleFrame(int frameNumber) {
             }
             else {
                 // Submit the frame to the decoder
-                submitFrame(qdu);
+                LiCompleteVideoFrame(qdu, VideoCallbacks.submitDecodeUnit(&qdu->decodeUnit));
             }
 
             // Notify the control connection
@@ -473,6 +528,13 @@ static void processRtpPayloadSlow(PBUFFER_DESC currentPos, PLENTRY_INTERNAL* exi
     LC_ASSERT(nalChainTail == NULL);
 
     while (currentPos->length != 0) {
+        // Skip any prepended AUD or SEI NALUs. We may have padding between
+        // these on IDR frames, so the check in processRtpPayload() is not
+        // completely sufficient to handle that case.
+        while (isAccessUnitDelimiter(currentPos) || isSeiNal(currentPos)) {
+            skipToNextNal(currentPos);
+        }
+
         int start = currentPos->offset;
         bool containsPicData = false;
 
@@ -555,13 +617,12 @@ void requestDecoderRefresh(void) {
 }
 
 // Return 1 if packet is the first one in the frame
-static int isFirstPacket(char flags) {
+static int isFirstPacket(uint8_t flags, uint8_t fecBlockNumber) {
     // Clear the picture data flag
     flags &= ~FLAG_CONTAINS_PIC_DATA;
 
     // Check if it's just the start or both start and end of a frame
-    return (flags == (FLAG_SOF | FLAG_EOF) ||
-        flags == FLAG_SOF);
+    return (flags == (FLAG_SOF | FLAG_EOF) || flags == FLAG_SOF) && fecBlockNumber == 0;
 }
 
 // Process an RTP Payload
@@ -570,10 +631,12 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
                        uint64_t receiveTimeMs, unsigned int presentationTimeMs,
                        PLENTRY_INTERNAL* existingEntry) {
     BUFFER_DESC currentPos;
-    unsigned int frameIndex;
-    char flags;
-    unsigned int firstPacket;
-    unsigned int streamPacketIndex;
+    uint32_t frameIndex;
+    uint8_t flags;
+    uint32_t firstPacket;
+    uint32_t streamPacketIndex;
+    uint8_t fecCurrentBlockNumber;
+    uint8_t fecLastBlockNumber;
 
     // Mask the top 8 bits from the SPI
     videoPacket->streamPacketIndex >>= 8;
@@ -583,9 +646,11 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
     currentPos.offset = 0;
     currentPos.length = length - sizeof(*videoPacket);
 
+    fecCurrentBlockNumber = (videoPacket->multiFecBlocks >> 4) & 0x3;
+    fecLastBlockNumber = (videoPacket->multiFecBlocks >> 6) & 0x3;
     frameIndex = videoPacket->frameIndex;
     flags = videoPacket->flags;
-    firstPacket = isFirstPacket(flags);
+    firstPacket = isFirstPacket(flags, fecCurrentBlockNumber);
 
     LC_ASSERT((flags & ~(FLAG_SOF | FLAG_EOF | FLAG_CONTAINS_PIC_DATA)) == 0);
 
@@ -600,7 +665,7 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
     // It almost always detects them before they get to us, but in case it doesn't
     // the streamPacketIndex not matching correctly should find nearly all of the rest.
     if (isBefore24(streamPacketIndex, U24(lastPacketInStream + 1)) ||
-            (!firstPacket && streamPacketIndex != U24(lastPacketInStream + 1))) {
+            (!(flags & FLAG_SOF) && streamPacketIndex != U24(lastPacketInStream + 1))) {
         Limelog("Depacketizer detected corrupt frame: %d", frameIndex);
         decodingFrame = false;
         nextFrameNumber = frameIndex + 1;
@@ -617,7 +682,16 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
     if (firstPacket) {
         // Make sure this is the next consecutive frame
         if (isBefore32(nextFrameNumber, frameIndex)) {
-            Limelog("Network dropped an entire frame\n");
+            if (nextFrameNumber + 1 == frameIndex) {
+                Limelog("Network dropped 1 frame (frame %d)\n", frameIndex - 1);
+            }
+            else {
+                Limelog("Network dropped %d frames (frames %d to %d)\n",
+                        frameIndex - nextFrameNumber,
+                        nextFrameNumber,
+                        frameIndex - 1);
+            }
+
             nextFrameNumber = frameIndex;
 
             // Wait until next complete frame
@@ -686,6 +760,12 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
         if (isAccessUnitDelimiter(&currentPos)) {
             skipToNextNal(&currentPos);
         }
+
+        // There may be one or more SEI NAL units prepended to the
+        // frame data *after* the (optional) AUD.
+        while (isSeiNal(&currentPos)) {
+            skipToNextNal(&currentPos);
+        }
     }
 
     if (firstPacket && isIdrFrameStart(&currentPos))
@@ -698,7 +778,7 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
         queueFragment(existingEntry, currentPos.data, currentPos.offset, currentPos.length);
     }
 
-    if (flags & FLAG_EOF) {
+    if ((flags & FLAG_EOF) && fecCurrentBlockNumber == fecLastBlockNumber) {
         // Move on to the next frame
         decodingFrame = false;
         nextFrameNumber = frameIndex + 1;
@@ -746,9 +826,9 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
 }
 
 // Add an RTP Packet to the queue
-void queueRtpPacket(PRTPFEC_QUEUE_ENTRY queueEntryPtr) {
+void queueRtpPacket(PRTPV_QUEUE_ENTRY queueEntryPtr) {
     int dataOffset;
-    RTPFEC_QUEUE_ENTRY queueEntry = *queueEntryPtr;
+    RTPV_QUEUE_ENTRY queueEntry = *queueEntryPtr;
 
     LC_ASSERT(!queueEntry.isParity);
     LC_ASSERT(queueEntry.receiveTimeMs != 0);
@@ -761,7 +841,7 @@ void queueRtpPacket(PRTPFEC_QUEUE_ENTRY queueEntryPtr) {
     // Reuse the memory reserved for the RTPFEC_QUEUE_ENTRY to store the LENTRY_INTERNAL
     // now that we're in the depacketizer. We saved a copy of the real FEC queue entry
     // on the stack here so we can safely modify this memory in place.
-    LC_ASSERT(sizeof(LENTRY_INTERNAL) <= sizeof(RTPFEC_QUEUE_ENTRY));
+    LC_ASSERT(sizeof(LENTRY_INTERNAL) <= sizeof(RTPV_QUEUE_ENTRY));
     PLENTRY_INTERNAL existingEntry = (PLENTRY_INTERNAL)queueEntryPtr;
     existingEntry->allocPtr = queueEntry.packet;
 

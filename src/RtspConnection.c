@@ -1,9 +1,8 @@
 #include "Limelight-internal.h"
 #include "Rtsp.h"
 
-#include <enet/enet.h>
-
 #define RTSP_TIMEOUT_SEC 10
+#define RTSP_RETRY_DELAY_MS 500
 
 static int currentSeqNumber;
 static char rtspTargetUrl[256];
@@ -209,7 +208,7 @@ Exit:
 }
 
 // Send RTSP message and get response over TCP
-static bool transactRtspMessageTcp(PRTSP_MESSAGE request, PRTSP_MESSAGE response, bool expectingPayload, int* error, int port1) {
+static bool transactRtspMessageTcp(PRTSP_MESSAGE request, PRTSP_MESSAGE response, int* error, int port1) {
     SOCK_RET err;
     bool ret;
     int offset;
@@ -217,17 +216,39 @@ static bool transactRtspMessageTcp(PRTSP_MESSAGE request, PRTSP_MESSAGE response
     int messageLen;
     char* responseBuffer;
     int responseBufferSize;
+    int connectRetries;
 
     *error = -1;
     ret = false;
     responseBuffer = NULL;
+    connectRetries = 0;
 
-    sock = connectTcpSocket(&RemoteAddr, RemoteAddrLen, port1+2, RTSP_TIMEOUT_SEC);
+    // Retry up to 10 seconds if we receive ECONNREFUSED errors from the host PC.
+    // This can happen with GFE 3.22 when initially launching a session because it
+    // returns HTTP 200 OK for the /launch request before the RTSP handshake port
+    // is listening.
+    do {
+        // sock = connectTcpSocket(&RemoteAddr, RemoteAddrLen, RtspPortNumber, RTSP_TIMEOUT_SEC);
+        sock = connectTcpSocket(&RemoteAddr, RemoteAddrLen, port1+2, RTSP_TIMEOUT_SEC);
+        if (sock == INVALID_SOCKET) {
+            *error = LastSocketError();
+            if (*error == ECONNREFUSED) {
+                // Try again after 500 ms on ECONNREFUSED
+                PltSleepMs(RTSP_RETRY_DELAY_MS);
+            }
+            else {
+                // Fail if we get some other error
+                break;
+            }
+        }
+        else {
+            // We successfully connected
+            break;
+        }
+    } while (connectRetries++ < (RTSP_TIMEOUT_SEC * 1000) / RTSP_RETRY_DELAY_MS && !ConnectionInterrupted);
     if (sock == INVALID_SOCKET) {
-        *error = LastSocketError();
         return ret;
     }
-    setRecvTimeout(sock, RTSP_TIMEOUT_SEC);
 
     serializedMessage = serializeRtspMessage(request, &messageLen);
     if (serializedMessage == NULL) {
@@ -250,6 +271,8 @@ static bool transactRtspMessageTcp(PRTSP_MESSAGE request, PRTSP_MESSAGE response
     offset = 0;
     responseBufferSize = 0;
     for (;;) {
+        struct pollfd pfd;
+
         if (offset >= responseBufferSize) {
             responseBufferSize = offset + 16384;
             responseBuffer = extendBuffer(responseBuffer, responseBufferSize);
@@ -257,6 +280,20 @@ static bool transactRtspMessageTcp(PRTSP_MESSAGE request, PRTSP_MESSAGE response
                 Limelog("Failed to allocate RTSP response buffer\n");
                 goto Exit;
             }
+        }
+
+        pfd.fd = sock;
+        pfd.events = POLLIN;
+        err = pollSockets(&pfd, 1, RTSP_TIMEOUT_SEC * 1000);
+        if (err == 0) {
+            *error = ETIMEDOUT;
+            Limelog("RTSP request timed out\n");
+            goto Exit;
+        }
+        else if (err < 0) {
+            *error = LastSocketError();
+            Limelog("Failed to wait for RTSP response: %d\n", *error);
+            goto Exit;
         }
 
         err = recv(sock, &responseBuffer[offset], responseBufferSize - offset, 0);
@@ -298,11 +335,16 @@ Exit:
 }
 
 static bool transactRtspMessage(PRTSP_MESSAGE request, PRTSP_MESSAGE response, bool expectingPayload, int* error, int port1) {
+    if (ConnectionInterrupted) {
+        *error = -1;
+        return false;
+    }
+
     if (useEnet) {
         return transactRtspMessageEnet(request, response, expectingPayload, error);
     }
     else {
-        return transactRtspMessageTcp(request, response, expectingPayload, error, port1);
+        return transactRtspMessageTcp(request, response, error, port1);
     }
 }
 
@@ -484,6 +526,36 @@ static int parseOpusConfigFromParamString(char* paramStr, int channelCount, POPU
     return 0;
 }
 
+// Parse the server port from the Transport header
+// Example: unicast;server_port=48000-48001;source=192.168.35.177
+static bool parseServerPortFromTransport(PRTSP_MESSAGE response, uint16_t* port) {
+    char* transport;
+    char* portStart;
+
+    transport = getOptionContent(response->options, "Transport");
+    if (transport == NULL) {
+        return false;
+    }
+
+    // Look for the server_port= entry in the Transport option
+    portStart = strstr(transport, "server_port=");
+    if (portStart == NULL) {
+        return false;
+    }
+
+    // Skip the prefix
+    portStart += strlen("server_port=");
+
+    // Validate the port number
+    long int rawPort = strtol(portStart, NULL, 10);
+    if (rawPort <= 0 || rawPort > 65535) {
+        return false;
+    }
+
+    *port = (uint16_t)rawPort;
+    return true;
+}
+
 // Parses the Opus configuration from an RTSP DESCRIBE response
 static int parseOpusConfigurations(PRTSP_MESSAGE response) {
     HighQualitySurroundSupported = false;
@@ -601,12 +673,15 @@ int performRtspHandshake(int port1) {
         strcpy(urlAddr, "0.0.0.0");
     }
 
+    LC_ASSERT(RtspPortNumber != 0);
+
     // Initialize global state
     useEnet = (AppVersionQuad[0] >= 5) && (AppVersionQuad[0] <= 7) && (AppVersionQuad[2] < 404);
-    sprintf(rtspTargetUrl, "rtsp%s://%s:48010", useEnet ? "ru" : "", urlAddr);
+    sprintf(rtspTargetUrl, "rtsp%s://%s:%u", useEnet ? "ru" : "", urlAddr, RtspPortNumber);
     currentSeqNumber = 1;
     hasSessionId = false;
     controlStreamId = APP_VERSION_AT_LEAST(7, 1, 431) ? "streamid=control/13/0" : "streamid=control/1/0";
+    AudioEncryptionEnabled = false;
 
     switch (AppVersionQuad[0]) {
         case 3:
@@ -634,7 +709,9 @@ int performRtspHandshake(int port1) {
         ENetEvent event;
         
         enet_address_set_address(&address, (struct sockaddr *)&RemoteAddr, RemoteAddrLen);
-        enet_address_set_port(&address, port1+2);
+        
+        // enet_address_set_port(&address, port1+2);
+        enet_address_set_port(&address, RtspPortNumber, port1+2);
         
         // Create a client that can use 1 outgoing connection and 1 channel
         client = enet_host_create(RemoteAddr.ss_family, NULL, 1, 1, 0, 0);
@@ -653,7 +730,7 @@ int performRtspHandshake(int port1) {
         // Wait for the connect to complete
         if (serviceEnetHost(client, &event, RTSP_TIMEOUT_SEC * 1000) <= 0 ||
             event.type != ENET_EVENT_TYPE_CONNECT) {
-            Limelog("RTSP: Failed to connect to UDP port 48010\n");
+            Limelog("RTSP: Failed to connect to UDP port %u\n", RtspPortNumber);
             enet_peer_reset(peer);
             peer = NULL;
             enet_host_destroy(client);
@@ -760,6 +837,23 @@ int performRtspHandshake(int port1) {
             goto Exit;
         }
 
+        // Parse the audio port out of the RTSP SETUP response
+        LC_ASSERT(AudioPortNumber == 0);
+        if (!parseServerPortFromTransport(&response, &AudioPortNumber)) {
+            // Use the well known port if parsing fails
+            AudioPortNumber = 48000;
+
+            Limelog("Audio port: %u (RTSP parsing failed)\n", AudioPortNumber);
+        }
+        else {
+            Limelog("Audio port: %u\n", AudioPortNumber);
+        }
+
+        // Let the audio stream know the port number is now finalized.
+        // NB: This is needed because audio stream init happens before RTSP,
+        // which is not the case for the video stream.
+        notifyAudioPortNegotiationComplete();
+
         sessionId = getOptionContent(response.options, "Session");
 
         if (sessionId == NULL) {
@@ -804,6 +898,18 @@ int performRtspHandshake(int port1) {
             goto Exit;
         }
 
+        // Parse the video port out of the RTSP SETUP response
+        LC_ASSERT(VideoPortNumber == 0);
+        if (!parseServerPortFromTransport(&response, &VideoPortNumber)) {
+            // Use the well known port if parsing fails
+            VideoPortNumber = 47998;
+
+            Limelog("Video port: %u (RTSP parsing failed)\n", VideoPortNumber);
+        }
+        else {
+            Limelog("Video port: %u\n", VideoPortNumber);
+        }
+
         freeMessage(&response);
     }
     
@@ -824,6 +930,18 @@ int performRtspHandshake(int port1) {
                 response.message.response.statusCode);
             ret = response.message.response.statusCode;
             goto Exit;
+        }
+
+        // Parse the control port out of the RTSP SETUP response
+        LC_ASSERT(ControlPortNumber == 0);
+        if (!parseServerPortFromTransport(&response, &ControlPortNumber)) {
+            // Use the well known port if parsing fails
+            ControlPortNumber = 47999;
+
+            Limelog("Control port: %u (RTSP parsing failed)\n", ControlPortNumber);
+        }
+        else {
+            Limelog("Control port: %u\n", ControlPortNumber);
         }
 
         freeMessage(&response);

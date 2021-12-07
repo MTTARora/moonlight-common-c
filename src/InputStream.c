@@ -1,24 +1,30 @@
 #include "Limelight-internal.h"
-#include "PlatformSockets.h"
-#include "PlatformThreads.h"
-#include "LinkedBlockingQueue.h"
-#include "Input.h"
 
 static SOCKET inputSock = INVALID_SOCKET;
 static unsigned char currentAesIv[16];
 static bool initialized;
+static bool encryptedControlStream;
 static PPLT_CRYPTO_CONTEXT cryptoContext;
 
 static LINKED_BLOCKING_QUEUE packetQueue;
+static LINKED_BLOCKING_QUEUE packetHolderFreeList;
 static PLT_THREAD inputSendThread;
 
 #define MAX_INPUT_PACKET_SIZE 128
 #define INPUT_STREAM_TIMEOUT_SEC 10
 
+#define MAX_QUEUED_INPUT_PACKETS 150
+
 // Contains input stream packets
 typedef struct _PACKET_HOLDER {
+    LINKED_BLOCKING_QUEUE_ENTRY entry;
     int packetLength;
+
+    // The union must be the last member since we abuse the NV_UNICODE_PACKET
+    // text field to store variable length data which gets split before being
+    // sent to the host.
     union {
+        NV_INPUT_HEADER header;
         NV_KEYBOARD_PACKET keyboard;
         NV_REL_MOUSE_MOVE_PACKET mouseMoveRel;
         NV_ABS_MOUSE_MOVE_PACKET mouseMoveAbs;
@@ -27,17 +33,21 @@ typedef struct _PACKET_HOLDER {
         NV_MULTI_CONTROLLER_PACKET multiController;
         NV_SCROLL_PACKET scroll;
         NV_HAPTICS_PACKET haptics;
+        NV_UNICODE_PACKET unicode;
     } packet;
-    LINKED_BLOCKING_QUEUE_ENTRY entry;
 } PACKET_HOLDER, *PPACKET_HOLDER;
 
 // Initializes the input stream
 int initializeInputStream(void) {
     memcpy(currentAesIv, StreamConfig.remoteInputAesIv, sizeof(currentAesIv));
     
-    LbqInitializeLinkedBlockingQueue(&packetQueue, 30);
+    // Set a high maximum queue size limit to ensure input isn't dropped
+    // while the input send thread is blocked for short periods.
+    LbqInitializeLinkedBlockingQueue(&packetQueue, MAX_QUEUED_INPUT_PACKETS);
+    LbqInitializeLinkedBlockingQueue(&packetHolderFreeList, MAX_QUEUED_INPUT_PACKETS);
 
     cryptoContext = PltCreateCryptoContext();
+    encryptedControlStream = APP_VERSION_AT_LEAST(7, 1, 431);
     return 0;
 }
 
@@ -57,13 +67,24 @@ void destroyInputStream(void) {
 
         entry = nextEntry;
     }
+
+    entry = LbqDestroyLinkedBlockingQueue(&packetHolderFreeList);
+
+    while (entry != NULL) {
+        nextEntry = entry->flink;
+
+        // The entry is stored in the data buffer
+        free(entry->data);
+
+        entry = nextEntry;
+    }
 }
 
 static int encryptData(unsigned char* plaintext, int plaintextLen,
                        unsigned char* ciphertext, int* ciphertextLen) {
     // Starting in Gen 7, AES GCM is used for encryption
     if (AppVersionQuad[0] >= 7) {
-        if (!PltEncryptMessage(cryptoContext, ALGORITHM_AES_GCM,
+        if (!PltEncryptMessage(cryptoContext, ALGORITHM_AES_GCM, 0,
                                (unsigned char*)StreamConfig.remoteInputAesKey, sizeof(StreamConfig.remoteInputAesKey),
                                currentAesIv, sizeof(currentAesIv),
                                ciphertext, 16,
@@ -79,12 +100,13 @@ static int encryptData(unsigned char* plaintext, int plaintextLen,
     else {
         // PKCS7 padding may need to be added in-place, so we must copy this into a buffer
         // that can safely be modified.
-        unsigned char paddedData[MAX_INPUT_PACKET_SIZE];
+        unsigned char paddedData[ROUND_TO_PKCS7_PADDED_LEN(MAX_INPUT_PACKET_SIZE)];
 
         memcpy(paddedData, plaintext, plaintextLen);
 
-        // Prior to Gen 7, 128-bit AES CBC is used for encryption
-        return PltEncryptMessage(cryptoContext, ALGORITHM_AES_CBC,
+        // Prior to Gen 7, 128-bit AES CBC is used for encryption with each message padded
+        // to the block size to ensure messages are not delayed within the cipher.
+        return PltEncryptMessage(cryptoContext, ALGORITHM_AES_CBC, CIPHER_FLAG_PAD_TO_BLOCK_SIZE,
                                  (unsigned char*)StreamConfig.remoteInputAesKey, sizeof(StreamConfig.remoteInputAesKey),
                                  currentAesIv, sizeof(currentAesIv),
                                  NULL, 0,
@@ -93,24 +115,139 @@ static int encryptData(unsigned char* plaintext, int plaintextLen,
     }
 }
 
+static void freePacketHolder(PPACKET_HOLDER holder) {
+    LC_ASSERT(holder->packetLength != 0);
+
+    // Place the packet holder back into the free list if it's a standard size entry
+    if (holder->packetLength > (int)sizeof(*holder) || LbqOfferQueueItem(&packetHolderFreeList, holder, &holder->entry) != LBQ_SUCCESS) {
+        free(holder);
+    }
+}
+
+static PPACKET_HOLDER allocatePacketHolder(int extraLength) {
+    PPACKET_HOLDER holder;
+    int err;
+
+    // If we're using an extended packet holder, we can't satisfy
+    // this allocation from the packet holder free list.
+    if (extraLength > 0) {
+        // We over-allocate here a bit since we're always adding sizeof(*holder),
+        // but this is on purpose. It allows us assume we have a full holder even
+        // if packetLength < sizeof(*holder) and put this allocation into the free
+        // list.
+        return malloc(sizeof(*holder) + extraLength);
+    }
+
+    // Grab an entry from the free list (if available)
+    err = LbqPollQueueElement(&packetHolderFreeList, (void**)&holder);
+    if (err == LBQ_SUCCESS) {
+        return holder;
+    }
+    else if (err == LBQ_INTERRUPTED) {
+        // We're shutting down. Don't bother allocating.
+        return NULL;
+    }
+    else {
+        LC_ASSERT(err == LBQ_NO_ELEMENT);
+
+        // Otherwise we'll have to allocate
+        return malloc(sizeof(*holder));
+    }
+}
+
+static bool sendInputPacket(PPACKET_HOLDER holder) {
+    SOCK_RET err;
+
+    LC_ASSERT(holder->packet.header.size == BE32(holder->packetLength - sizeof(uint32_t)));
+
+    // On GFE 3.22, the entire control stream is encrypted (and support for separate RI encrypted)
+    // has been removed. We send the plaintext packet through and the control stream code will do
+    // the encryption.
+    if (encryptedControlStream) {
+        err = (SOCK_RET)sendInputPacketOnControlStream((unsigned char*)&holder->packet, holder->packetLength);
+        if (err < 0) {
+            Limelog("Input: sendInputPacketOnControlStream() failed: %d\n", (int) err);
+            ListenerCallbacks.connectionTerminated(err);
+            return false;
+        }
+    }
+    else {
+        char encryptedBuffer[MAX_INPUT_PACKET_SIZE];
+        uint32_t encryptedSize;
+        uint32_t encryptedLengthPrefix;
+
+        // Encrypt the message into the output buffer while leaving room for the length
+        encryptedSize = sizeof(encryptedBuffer) - sizeof(encryptedLengthPrefix);
+        err = encryptData((unsigned char*)&holder->packet, holder->packetLength,
+            (unsigned char*)&encryptedBuffer[sizeof(encryptedLengthPrefix)], (int*)&encryptedSize);
+        if (err != 0) {
+            Limelog("Input: Encryption failed: %d\n", (int)err);
+            ListenerCallbacks.connectionTerminated(err);
+            return false;
+        }
+
+        // Prepend the length to the message
+        encryptedLengthPrefix = BE32(encryptedSize);
+        memcpy(&encryptedBuffer[0], &encryptedLengthPrefix, sizeof(encryptedLengthPrefix));
+
+        if (AppVersionQuad[0] < 5) {
+            // Send the encrypted payload
+            err = send(inputSock, (const char*) encryptedBuffer,
+                (int) (encryptedSize + sizeof(encryptedLengthPrefix)), 0);
+            if (err <= 0) {
+                Limelog("Input: send() failed: %d\n", (int) LastSocketError());
+                ListenerCallbacks.connectionTerminated(LastSocketFail());
+                return false;
+            }
+        }
+        else {
+            // For reasons that I can't understand, NVIDIA decides to use the last 16
+            // bytes of ciphertext in the most recent game controller packet as the IV for
+            // future encryption. I think it may be a buffer overrun on their end but we'll have
+            // to mimic it to work correctly.
+            if (AppVersionQuad[0] >= 7 && encryptedSize >= 16 + sizeof(currentAesIv)) {
+                memcpy(currentAesIv,
+                       &encryptedBuffer[4 + encryptedSize - sizeof(currentAesIv)],
+                       sizeof(currentAesIv));
+            }
+
+            err = (SOCK_RET)sendInputPacketOnControlStream((unsigned char*) encryptedBuffer,
+                (int) (encryptedSize + sizeof(encryptedLengthPrefix)));
+            if (err < 0) {
+                Limelog("Input: sendInputPacketOnControlStream() failed: %d\n", (int) err);
+                ListenerCallbacks.connectionTerminated(err);
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 // Input thread proc
 static void inputSendThreadProc(void* context) {
     SOCK_RET err;
     PPACKET_HOLDER holder;
-    char encryptedBuffer[MAX_INPUT_PACKET_SIZE];
-    uint32_t encryptedSize;
-    bool encryptedControlStream = APP_VERSION_AT_LEAST(7, 1, 431);
+    uint32_t multiControllerMagicLE;
+    uint32_t relMouseMagicLE;
+
+    if (AppVersionQuad[0] >= 5) {
+        multiControllerMagicLE = LE32(MULTI_CONTROLLER_MAGIC_GEN5);
+        relMouseMagicLE = LE32(MOUSE_MOVE_REL_MAGIC_GEN5);
+    }
+    else {
+        multiControllerMagicLE = LE32(MULTI_CONTROLLER_MAGIC);
+        relMouseMagicLE = LE32(MOUSE_MOVE_REL_MAGIC);
+    }
 
     while (!PltIsThreadInterrupted(&inputSendThread)) {
-        int encryptedLengthPrefix;
-
         err = LbqWaitForQueueElement(&packetQueue, (void**)&holder);
         if (err != LBQ_SUCCESS) {
             return;
         }
 
         // If it's a multi-controller packet we can do batching
-        if (holder->packet.multiController.header.packetType == BE32(PACKET_TYPE_MULTI_CONTROLLER)) {
+        if (holder->packet.header.magic == multiControllerMagicLE) {
             PPACKET_HOLDER controllerBatchHolder;
             PNV_MULTI_CONTROLLER_PACKET origPkt;
 
@@ -124,7 +261,7 @@ static void inputSendThreadProc(void* context) {
                 }
 
                 // If it's not a controller packet, we're done
-                if (controllerBatchHolder->packet.multiController.header.packetType != BE32(PACKET_TYPE_MULTI_CONTROLLER)) {
+                if (controllerBatchHolder->packet.header.magic != multiControllerMagicLE) {
                     break;
                 }
 
@@ -155,11 +292,11 @@ static void inputSendThreadProc(void* context) {
                 origPkt->rightStickY = newPkt->rightStickY;
 
                 // Free the batched packet holder
-                free(controllerBatchHolder);
+                freePacketHolder(controllerBatchHolder);
             }
         }
         // If it's a relative mouse move packet, we can also do batching
-        else if (holder->packet.mouseMoveRel.header.packetType == BE32(PACKET_TYPE_REL_MOUSE_MOVE)) {
+        else if (holder->packet.header.magic == relMouseMagicLE) {
             PPACKET_HOLDER mouseBatchHolder;
             int totalDeltaX = (short)BE16(holder->packet.mouseMoveRel.deltaX);
             int totalDeltaY = (short)BE16(holder->packet.mouseMoveRel.deltaY);
@@ -174,7 +311,7 @@ static void inputSendThreadProc(void* context) {
                 }
 
                 // If it's not a mouse move packet, we're done
-                if (mouseBatchHolder->packet.mouseMoveRel.header.packetType != BE32(PACKET_TYPE_REL_MOUSE_MOVE)) {
+                if (mouseBatchHolder->packet.header.magic != relMouseMagicLE) {
                     break;
                 }
 
@@ -199,7 +336,7 @@ static void inputSendThreadProc(void* context) {
                 totalDeltaY += partialDeltaY;
 
                 // Free the batched packet holder
-                free(mouseBatchHolder);
+                freePacketHolder(mouseBatchHolder);
             }
 
             // Update the original packet
@@ -207,7 +344,7 @@ static void inputSendThreadProc(void* context) {
             holder->packet.mouseMoveRel.deltaY = BE16((short)totalDeltaY);
         }
         // If it's an absolute mouse move packet, we should only send the latest
-        else if (holder->packet.mouseMoveAbs.header.packetType == BE32(PACKET_TYPE_ABS_MOUSE_MOVE)) {
+        else if (holder->packet.header.magic == LE32(MOUSE_MOVE_ABS_MAGIC)) {
             for (;;) {
                 PPACKET_HOLDER mouseBatchHolder;
 
@@ -217,7 +354,7 @@ static void inputSendThreadProc(void* context) {
                 }
 
                 // If it's not a mouse position packet, we're done
-                if (mouseBatchHolder->packet.mouseMoveAbs.header.packetType != BE32(PACKET_TYPE_ABS_MOUSE_MOVE)) {
+                if (mouseBatchHolder->packet.header.magic != LE32(MOUSE_MOVE_ABS_MAGIC)) {
                     break;
                 }
 
@@ -227,69 +364,67 @@ static void inputSendThreadProc(void* context) {
                 }
 
                 // Replace the current packet with the new one
-                free(holder);
+                freePacketHolder(holder);
                 holder = mouseBatchHolder;
             }
         }
+        // If it's a UTF-8 text packet, we may need to split it into a several packets to send
+        else if (holder->packet.header.magic == LE32(UTF8_TEXT_EVENT_MAGIC)) {
+            PACKET_HOLDER splitPacket;
+            uint32_t totalLength = BE32(holder->packet.unicode.header.size) - sizeof(uint32_t);
+            uint32_t i = 0;
 
-        // On GFE 3.22, the entire control stream is encrypted (and support for separate RI encrypted)
-        // has been removed. We send the plaintext packet through and the control stream code will do
-        // the encryption.
-        if (encryptedControlStream) {
-            err = (SOCK_RET)sendInputPacketOnControlStream((unsigned char*)&holder->packet, holder->packetLength);
-            free(holder);
-            if (err < 0) {
-                Limelog("Input: sendInputPacketOnControlStream() failed: %d\n", (int) err);
-                ListenerCallbacks.connectionTerminated(err);
-                return;
-            }
-        }
-        else {
-            // Encrypt the message into the output buffer while leaving room for the length
-            encryptedSize = sizeof(encryptedBuffer) - 4;
-            err = encryptData((unsigned char*)&holder->packet, holder->packetLength,
-                (unsigned char*)&encryptedBuffer[4], (int*)&encryptedSize);
-            free(holder);
-            if (err != 0) {
-                Limelog("Input: Encryption failed: %d\n", (int)err);
-                ListenerCallbacks.connectionTerminated(err);
-                return;
-            }
+            // We send each Unicode code point individually. This way we can always ensure they will
+            // never straddle a packet boundary (which will cause a parsing error on the host).
+            while (i < totalLength) {
+                uint32_t codePointLength;
+                uint8_t firstByte = (uint8_t)holder->packet.unicode.text[i];
+                if ((firstByte & 0x80) == 0x00) {
+                    // 1 byte code point
+                    codePointLength = 1;
+                }
+                else if ((firstByte & 0xE0) == 0xC0) {
+                    // 2 byte code point
+                    codePointLength = 2;
+                }
+                else if ((firstByte & 0xF0) == 0xE0) {
+                    // 3 byte code point
+                    codePointLength = 3;
+                }
+                else if ((firstByte & 0xF8) == 0xF0) {
+                    // 4 byte code point
+                    codePointLength = 4;
+                }
+                else {
+                    Limelog("Invalid unicode code point starting byte: %02x\n", firstByte);
+                    break;
+                }
 
-            // Prepend the length to the message
-            encryptedLengthPrefix = BE32(encryptedSize);
-            memcpy(&encryptedBuffer[0], &encryptedLengthPrefix, 4);
+                splitPacket.packetLength = sizeof(uint32_t) + sizeof(uint32_t) + codePointLength;
+                splitPacket.packet.unicode.header.size = BE32(splitPacket.packetLength - sizeof(uint32_t));
+                splitPacket.packet.unicode.header.magic = LE32(UTF8_TEXT_EVENT_MAGIC);
+                memcpy(splitPacket.packet.unicode.text, &holder->packet.unicode.text[i], codePointLength);
 
-            if (AppVersionQuad[0] < 5) {
-                // Send the encrypted payload
-                err = send(inputSock, (const char*) encryptedBuffer,
-                    (int) (encryptedSize + sizeof(encryptedLengthPrefix)), 0);
-                if (err <= 0) {
-                    Limelog("Input: send() failed: %d\n", (int) LastSocketError());
-                    ListenerCallbacks.connectionTerminated(LastSocketFail());
+                // Encrypt and send the split packet
+                if (!sendInputPacket(&splitPacket)) {
+                    freePacketHolder(holder);
                     return;
                 }
-            }
-            else {
-                // For reasons that I can't understand, NVIDIA decides to use the last 16
-                // bytes of ciphertext in the most recent game controller packet as the IV for
-                // future encryption. I think it may be a buffer overrun on their end but we'll have
-                // to mimic it to work correctly.
-                if (AppVersionQuad[0] >= 7 && encryptedSize >= 16 + sizeof(currentAesIv)) {
-                    memcpy(currentAesIv,
-                           &encryptedBuffer[4 + encryptedSize - sizeof(currentAesIv)],
-                           sizeof(currentAesIv));
-                }
 
-                err = (SOCK_RET)sendInputPacketOnControlStream((unsigned char*) encryptedBuffer,
-                    (int) (encryptedSize + sizeof(encryptedLengthPrefix)));
-                if (err < 0) {
-                    Limelog("Input: sendInputPacketOnControlStream() failed: %d\n", (int) err);
-                    ListenerCallbacks.connectionTerminated(err);
-                    return;
-                }
+                i += codePointLength;
             }
+
+            freePacketHolder(holder);
+            continue;
         }
+
+        // Encrypt and send the input packet
+        if (!sendInputPacket(holder)) {
+            freePacketHolder(holder);
+            return;
+        }
+
+        freePacketHolder(holder);
     }
 }
 
@@ -304,19 +439,21 @@ static int sendEnableHaptics(void) {
         return 0;
     }
 
-    holder = malloc(sizeof(*holder));
+    holder = allocatePacketHolder(0);
     if (holder == NULL) {
         return -1;
     }
 
     holder->packetLength = sizeof(NV_HAPTICS_PACKET);
-    holder->packet.haptics.header.packetType = BE32(PACKET_TYPE_HAPTICS);
-    holder->packet.haptics.magicA = LE32(H_MAGIC_A);
-    holder->packet.haptics.magicB = LE32(H_MAGIC_B);
+    holder->packet.haptics.header.size = BE32(holder->packetLength - sizeof(uint32_t));
+    holder->packet.haptics.header.magic = LE32(ENABLE_HAPTICS_MAGIC);
+    holder->packet.haptics.enable = LE16(1);
 
     err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
     if (err != LBQ_SUCCESS) {
-        free(holder);
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        Limelog("Input queue reached maximum size limit\n");
+        freePacketHolder(holder);
     }
 
     return err;
@@ -359,17 +496,17 @@ int startInputStream(void) {
 int stopInputStream(void) {
     // No more packets should be queued now
     initialized = false;
+    LbqSignalQueueShutdown(&packetHolderFreeList);
 
-    // Signal the input send thread
-    LbqSignalQueueShutdown(&packetQueue);
-    PltInterruptThread(&inputSendThread);
+    // Signal the input send thread to drain all pending
+    // input packets before shutting down.
+    LbqSignalQueueDrain(&packetQueue);
+    PltJoinThread(&inputSendThread);
+    PltCloseThread(&inputSendThread);
 
     if (inputSock != INVALID_SOCKET) {
         shutdownTcpSocket(inputSock);
     }
-
-    PltJoinThread(&inputSendThread);
-    PltCloseThread(&inputSendThread);
     
     if (inputSock != INVALID_SOCKET) {
         closeSocket(inputSock);
@@ -392,25 +529,27 @@ int LiSendMouseMoveEvent(short deltaX, short deltaY) {
         return 0;
     }
 
-    holder = malloc(sizeof(*holder));
+    holder = allocatePacketHolder(0);
     if (holder == NULL) {
         return -1;
     }
 
     holder->packetLength = sizeof(NV_REL_MOUSE_MOVE_PACKET);
-    holder->packet.mouseMoveRel.header.packetType = BE32(PACKET_TYPE_REL_MOUSE_MOVE);
-    holder->packet.mouseMoveRel.magic = MOUSE_MOVE_REL_MAGIC;
-    // On Gen 5 servers, the header code is incremented by one
+    holder->packet.mouseMoveRel.header.size = BE32(holder->packetLength - sizeof(uint32_t));
     if (AppVersionQuad[0] >= 5) {
-        holder->packet.mouseMoveRel.magic++;
+        holder->packet.mouseMoveRel.header.magic = LE32(MOUSE_MOVE_REL_MAGIC_GEN5);
     }
-    holder->packet.mouseMoveRel.magic = LE32(holder->packet.mouseMoveRel.magic);
+    else {
+        holder->packet.mouseMoveRel.header.magic = LE32(MOUSE_MOVE_REL_MAGIC);
+    }
     holder->packet.mouseMoveRel.deltaX = BE16(deltaX);
     holder->packet.mouseMoveRel.deltaY = BE16(deltaY);
 
     err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
     if (err != LBQ_SUCCESS) {
-        free(holder);
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        Limelog("Input queue reached maximum size limit\n");
+        freePacketHolder(holder);
     }
 
     return err;
@@ -425,14 +564,14 @@ int LiSendMousePositionEvent(short x, short y, short referenceWidth, short refer
         return -2;
     }
 
-    holder = malloc(sizeof(*holder));
+    holder = allocatePacketHolder(0);
     if (holder == NULL) {
         return -1;
     }
 
     holder->packetLength = sizeof(NV_ABS_MOUSE_MOVE_PACKET);
-    holder->packet.mouseMoveAbs.header.packetType = BE32(PACKET_TYPE_ABS_MOUSE_MOVE);
-    holder->packet.mouseMoveAbs.magic = LE32(MOUSE_MOVE_ABS_MAGIC);
+    holder->packet.mouseMoveAbs.header.size = BE32(holder->packetLength - sizeof(uint32_t));
+    holder->packet.mouseMoveAbs.header.magic = LE32(MOUSE_MOVE_ABS_MAGIC);
     holder->packet.mouseMoveAbs.x = BE16(x);
     holder->packet.mouseMoveAbs.y = BE16(y);
     holder->packet.mouseMoveAbs.unused = 0;
@@ -447,7 +586,9 @@ int LiSendMousePositionEvent(short x, short y, short referenceWidth, short refer
 
     err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
     if (err != LBQ_SUCCESS) {
-        free(holder);
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        Limelog("Input queue reached maximum size limit\n");
+        freePacketHolder(holder);
     }
 
     return err;
@@ -462,22 +603,25 @@ int LiSendMouseButtonEvent(char action, int button) {
         return -2;
     }
 
-    holder = malloc(sizeof(*holder));
+    holder = allocatePacketHolder(0);
     if (holder == NULL) {
         return -1;
     }
 
     holder->packetLength = sizeof(NV_MOUSE_BUTTON_PACKET);
-    holder->packet.mouseButton.header.packetType = BE32(PACKET_TYPE_MOUSE_BUTTON);
-    holder->packet.mouseButton.action = action;
+    holder->packet.mouseButton.header.size = BE32(holder->packetLength - sizeof(uint32_t));
+    holder->packet.mouseButton.header.magic = (uint8_t)action;
     if (AppVersionQuad[0] >= 5) {
-        holder->packet.mouseButton.action++;
+        holder->packet.mouseButton.header.magic++;
     }
-    holder->packet.mouseButton.button = BE32(button);
+    holder->packet.mouseButton.header.magic = LE32(holder->packet.mouseButton.header.magic);
+    holder->packet.mouseButton.button = (uint8_t)button;
 
     err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
     if (err != LBQ_SUCCESS) {
-        free(holder);
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        Limelog("Input queue reached maximum size limit\n");
+        freePacketHolder(holder);
     }
 
     return err;
@@ -492,7 +636,7 @@ int LiSendKeyboardEvent(short keyCode, char keyAction, char modifiers) {
         return -2;
     }
 
-    holder = malloc(sizeof(*holder));
+    holder = allocatePacketHolder(0);
     if (holder == NULL) {
         return -1;
     }
@@ -540,8 +684,8 @@ int LiSendKeyboardEvent(short keyCode, char keyAction, char modifiers) {
     }
 
     holder->packetLength = sizeof(NV_KEYBOARD_PACKET);
-    holder->packet.keyboard.header.packetType = BE32(PACKET_TYPE_KEYBOARD);
-    holder->packet.keyboard.keyAction = keyAction;
+    holder->packet.keyboard.header.size = BE32(holder->packetLength - sizeof(uint32_t));
+    holder->packet.keyboard.header.magic = LE32((uint32_t)keyAction);
     holder->packet.keyboard.zero1 = 0;
     holder->packet.keyboard.keyCode = LE16(keyCode);
     holder->packet.keyboard.modifiers = modifiers;
@@ -549,7 +693,38 @@ int LiSendKeyboardEvent(short keyCode, char keyAction, char modifiers) {
 
     err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
     if (err != LBQ_SUCCESS) {
-        free(holder);
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        Limelog("Input queue reached maximum size limit\n");
+        freePacketHolder(holder);
+    }
+
+    return err;
+}
+
+int LiSendUtf8TextEvent(const char *text, unsigned int length) {
+    PPACKET_HOLDER holder;
+    int err;
+
+    if (!initialized) {
+        return -2;
+    }
+
+    holder = allocatePacketHolder(length);
+    if (holder == NULL) {
+        return -1;
+    }
+    // Size + magic + string length
+    holder->packetLength = sizeof(uint32_t) + sizeof(uint32_t) + length;
+    // Magic + string length
+    holder->packet.unicode.header.size = BE32(holder->packetLength - sizeof(uint32_t));
+    holder->packet.unicode.header.magic = LE32(UTF8_TEXT_EVENT_MAGIC);
+    memcpy(holder->packet.unicode.text, text, length);
+
+    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    if (err != LBQ_SUCCESS) {
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        Limelog("Input queue reached maximum size limit\n");
+        freePacketHolder(holder);
     }
 
     return err;
@@ -566,7 +741,7 @@ static int sendControllerEventInternal(short controllerNumber, short activeGamep
         return -2;
     }
 
-    holder = malloc(sizeof(*holder));
+    holder = allocatePacketHolder(0);
     if (holder == NULL) {
         return -1;
     }
@@ -575,8 +750,8 @@ static int sendControllerEventInternal(short controllerNumber, short activeGamep
         // Generation 3 servers don't support multiple controllers so we send
         // the legacy packet
         holder->packetLength = sizeof(NV_CONTROLLER_PACKET);
-        holder->packet.controller.header.packetType = BE32(PACKET_TYPE_CONTROLLER);
-        holder->packet.controller.headerA = LE32(C_HEADER_A);
+        holder->packet.controller.header.size = BE32(holder->packetLength - sizeof(uint32_t));
+        holder->packet.controller.header.magic = LE32(CONTROLLER_MAGIC);
         holder->packet.controller.headerB = LE16(C_HEADER_B);
         holder->packet.controller.buttonFlags = LE16(buttonFlags);
         holder->packet.controller.leftTrigger = leftTrigger;
@@ -591,13 +766,14 @@ static int sendControllerEventInternal(short controllerNumber, short activeGamep
     else {
         // Generation 4+ servers support passing the controller number
         holder->packetLength = sizeof(NV_MULTI_CONTROLLER_PACKET);
-        holder->packet.multiController.header.packetType = BE32(PACKET_TYPE_MULTI_CONTROLLER);
-        holder->packet.multiController.headerA = MC_HEADER_A;
+        holder->packet.multiController.header.size = BE32(holder->packetLength - sizeof(uint32_t));
         // On Gen 5 servers, the header code is decremented by one
         if (AppVersionQuad[0] >= 5) {
-            holder->packet.multiController.headerA--;
+            holder->packet.multiController.header.magic = LE32(MULTI_CONTROLLER_MAGIC_GEN5);
         }
-        holder->packet.multiController.headerA = LE32(holder->packet.multiController.headerA);
+        else {
+            holder->packet.multiController.header.magic = LE32(MULTI_CONTROLLER_MAGIC);
+        }
         holder->packet.multiController.headerB = LE16(MC_HEADER_B);
         holder->packet.multiController.controllerNumber = LE16(controllerNumber);
         holder->packet.multiController.activeGamepadMask = LE16(activeGamepadMask);
@@ -615,7 +791,9 @@ static int sendControllerEventInternal(short controllerNumber, short activeGamep
 
     err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
     if (err != LBQ_SUCCESS) {
-        free(holder);
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        Limelog("Input queue reached maximum size limit\n");
+        freePacketHolder(holder);
     }
 
     return err;
@@ -652,27 +830,28 @@ int LiSendHighResScrollEvent(short scrollAmount) {
         return 0;
     }
 
-    holder = malloc(sizeof(*holder));
+    holder = allocatePacketHolder(0);
     if (holder == NULL) {
         return -1;
     }
 
     holder->packetLength = sizeof(NV_SCROLL_PACKET);
-    holder->packet.scroll.header.packetType = BE32(PACKET_TYPE_SCROLL);
-    holder->packet.scroll.magicA = MAGIC_A;
-    // On Gen 5 servers, the header code is incremented by one
+    holder->packet.scroll.header.size = BE32(holder->packetLength - sizeof(uint32_t));
     if (AppVersionQuad[0] >= 5) {
-        holder->packet.scroll.magicA++;
+        holder->packet.scroll.header.magic = LE32(SCROLL_MAGIC_GEN5);
     }
-    holder->packet.scroll.zero1 = 0;
-    holder->packet.scroll.zero2 = 0;
+    else {
+        holder->packet.scroll.header.magic = LE32(SCROLL_MAGIC);
+    }
     holder->packet.scroll.scrollAmt1 = BE16(scrollAmount);
     holder->packet.scroll.scrollAmt2 = holder->packet.scroll.scrollAmt1;
     holder->packet.scroll.zero3 = 0;
 
     err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
     if (err != LBQ_SUCCESS) {
-        free(holder);
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        Limelog("Input queue reached maximum size limit\n");
+        freePacketHolder(holder);
     }
 
     return err;

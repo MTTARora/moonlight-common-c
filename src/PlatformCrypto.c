@@ -10,9 +10,6 @@ bool RandomStateInitialized = false;
 #else
 #include <openssl/evp.h>
 #include <openssl/rand.h>
-
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
-#define EVP_CIPHER_CTX_reset(x) EVP_CIPHER_CTX_cleanup(x); EVP_CIPHER_CTX_init(x)
 #endif
 
 static int addPkcs7PaddingInPlace(unsigned char* plaintext, int plaintextLen) {
@@ -23,10 +20,14 @@ static int addPkcs7PaddingInPlace(unsigned char* plaintext, int plaintextLen) {
 
     return paddedLength;
 }
-#endif
 
-// For CBC modes, inputData buffer must be allocated with length rounded up to next multiple of 16 and inputData buffer may be modified!
-bool PltEncryptMessage(PPLT_CRYPTO_CONTEXT ctx, int algorithm,
+// When CIPHER_FLAG_PAD_TO_BLOCK_SIZE is used, inputData buffer must be allocated such that
+// the buffer length is at least ROUND_TO_PKCS7_PADDED_LEN(inputDataLength) and inputData
+// buffer may be modified!
+// For GCM, the IV can change from message to message without CIPHER_FLAG_RESET_IV.
+// CIPHER_FLAG_RESET_IV is only required for GCM when the IV length changes.
+// Changing the key between encrypt/decrypt calls on a single context is not supported.
+bool PltEncryptMessage(PPLT_CRYPTO_CONTEXT ctx, int algorithm, int flags,
                        unsigned char* key, int keyLength,
                        unsigned char* iv, int ivLength,
                        unsigned char* tag, int tagLength,
@@ -72,62 +73,98 @@ bool PltEncryptMessage(PPLT_CRYPTO_CONTEXT ctx, int algorithm,
         }
     }
     else {
-        if (mbedtls_cipher_crypt(&ctx->ctx, iv, ivLength, inputData, inputDataLength, outputData, &outLength) != 0) {
+        if (flags & CIPHER_FLAG_RESET_IV) {
+            if (mbedtls_cipher_set_iv(&ctx->ctx, iv, ivLength) != 0) {
+                return false;
+            }
+
+            mbedtls_cipher_reset(&ctx->ctx);
+        }
+
+        if (flags & CIPHER_FLAG_PAD_TO_BLOCK_SIZE) {
+            inputDataLength = addPkcs7PaddingInPlace(inputData, inputDataLength);
+        }
+
+        if (mbedtls_cipher_update(&ctx->ctx, inputData, inputDataLength, outputData, &outLength) != 0) {
             return false;
+        }
+
+        if (flags & CIPHER_FLAG_FINISH) {
+            size_t finishLength;
+
+            if (mbedtls_cipher_finish(&ctx->ctx, &outputData[outLength], &finishLength) != 0) {
+                return false;
+            }
+
+            outLength += finishLength;
         }
     }
 
     *outputDataLength = outLength;
     return true;
 #else
-    bool ret = false;
-    const EVP_CIPHER* cipher;
-
-    switch (algorithm) {
-    case ALGORITHM_AES_CBC:
-        LC_ASSERT(keyLength == 16);
-        LC_ASSERT(tag == NULL);
-        LC_ASSERT(tagLength == 0);
-        cipher = EVP_aes_128_cbc();
-        break;
-    case ALGORITHM_AES_GCM:
-        LC_ASSERT(keyLength == 16);
-        LC_ASSERT(tag != NULL);
-        LC_ASSERT(tagLength > 0);
-        cipher = EVP_aes_128_gcm();
-        break;
-    default:
-        LC_ASSERT(false);
-        return false;
-    }
+    LC_ASSERT(keyLength == 16);
 
     if (algorithm == ALGORITHM_AES_GCM) {
-        if (EVP_EncryptInit_ex(ctx->ctx, cipher, NULL, NULL, NULL) != 1) {
-            goto cleanup;
-        }
+        LC_ASSERT(tag != NULL);
+        LC_ASSERT(tagLength > 0);
 
-        if (EVP_CIPHER_CTX_ctrl(ctx->ctx, EVP_CTRL_GCM_SET_IVLEN, ivLength, NULL) != 1) {
-            goto cleanup;
-        }
+        if (!ctx->initialized || (flags & CIPHER_FLAG_RESET_IV)) {
+            // Perform a full initialization. This codepath also allows
+            // us to change the IV length if required.
+            if (EVP_EncryptInit_ex(ctx->ctx, EVP_aes_128_gcm(), NULL, NULL, NULL) != 1) {
+                return false;
+            }
 
-        if (EVP_EncryptInit_ex(ctx->ctx, NULL, NULL, key, iv) != 1) {
-            goto cleanup;
-        }
-    }
-    else {
-        if (!ctx->initialized) {
-            if (EVP_EncryptInit_ex(ctx->ctx, cipher, NULL, key, iv) != 1) {
-                goto cleanup;
+            if (EVP_CIPHER_CTX_ctrl(ctx->ctx, EVP_CTRL_GCM_SET_IVLEN, ivLength, NULL) != 1) {
+                return false;
+            }
+
+            if (EVP_EncryptInit_ex(ctx->ctx, NULL, NULL, key, iv) != 1) {
+                return false;
             }
 
             ctx->initialized = true;
         }
+        else {
+            // Calling with cipher == NULL results in a parameter change
+            // without requiring a reallocation of the internal cipher ctx.
+            if (EVP_EncryptInit_ex(ctx->ctx, NULL, NULL, NULL, iv) != 1) {
+                return false;
+            }
+        }
+    }
+    else if (algorithm == ALGORITHM_AES_CBC) {
+        LC_ASSERT(tag == NULL);
+        LC_ASSERT(tagLength == 0);
 
-        inputDataLength = addPkcs7PaddingInPlace(inputData, inputDataLength);
+        if (!ctx->initialized) {
+            // Perform a full initialization
+            if (EVP_EncryptInit_ex(ctx->ctx, EVP_aes_128_cbc(), NULL, key, iv) != 1) {
+                return false;
+            }
+
+            ctx->initialized = true;
+        }
+        else if (flags & CIPHER_FLAG_RESET_IV) {
+            // Calling with cipher == NULL results in a parameter change
+            // without requiring a reallocation of the internal cipher ctx.
+            if (EVP_EncryptInit_ex(ctx->ctx, NULL, NULL, NULL, iv) != 1) {
+                return false;
+            }
+        }
+
+        if (flags & CIPHER_FLAG_PAD_TO_BLOCK_SIZE) {
+            inputDataLength = addPkcs7PaddingInPlace(inputData, inputDataLength);
+        }
+    }
+    else {
+        LC_ASSERT(false);
+        return false;
     }
 
     if (EVP_EncryptUpdate(ctx->ctx, outputData, outputDataLength, inputData, inputDataLength) != 1) {
-        goto cleanup;
+        return false;
     }
 
     if (algorithm == ALGORITHM_AES_GCM) {
@@ -135,26 +172,34 @@ bool PltEncryptMessage(PPLT_CRYPTO_CONTEXT ctx, int algorithm,
 
         // GCM encryption won't ever fill ciphertext here but we have to call it anyway
         if (EVP_EncryptFinal_ex(ctx->ctx, outputData, &len) != 1) {
-            goto cleanup;
+            return false;
         }
         LC_ASSERT(len == 0);
 
         if (EVP_CIPHER_CTX_ctrl(ctx->ctx, EVP_CTRL_GCM_GET_TAG, tagLength, tag) != 1) {
-            goto cleanup;
+            return false;
         }
     }
+    else if (flags & CIPHER_FLAG_FINISH) {
+        int len;
 
-    ret = true;
+        if (EVP_EncryptFinal_ex(ctx->ctx, &outputData[*outputDataLength], &len) != 1) {
+            return false;
+        }
 
-cleanup:
-    if (algorithm == ALGORITHM_AES_GCM) {
-        EVP_CIPHER_CTX_reset(ctx->ctx);
+        *outputDataLength += len;
     }
-    return ret;
+
+    return true;
 #endif
 }
 
-bool PltDecryptMessage(PPLT_CRYPTO_CONTEXT ctx, int algorithm,
+// When CBC is used, outputData buffer must be allocated such that the buffer length is
+// at least ROUND_TO_PKCS7_PADDED_LEN(inputDataLength) to allow room for PKCS7 padding.
+// For GCM, the IV can change from message to message without CIPHER_FLAG_RESET_IV.
+// CIPHER_FLAG_RESET_IV is only required for GCM when the IV length changes.
+// Changing the key between encrypt/decrypt calls on a single context is not supported.
+bool PltDecryptMessage(PPLT_CRYPTO_CONTEXT ctx, int algorithm, int flags,
                        unsigned char* key, int keyLength,
                        unsigned char* iv, int ivLength,
                        unsigned char* tag, int tagLength,
@@ -200,60 +245,90 @@ bool PltDecryptMessage(PPLT_CRYPTO_CONTEXT ctx, int algorithm,
         }
     }
     else {
-        if (mbedtls_cipher_crypt(&ctx->ctx, iv, ivLength, inputData, inputDataLength, outputData, &outLength) != 0) {
+        if (flags & CIPHER_FLAG_RESET_IV) {
+            if (mbedtls_cipher_set_iv(&ctx->ctx, iv, ivLength) != 0) {
+                return false;
+            }
+
+            mbedtls_cipher_reset(&ctx->ctx);
+        }
+
+        if (mbedtls_cipher_update(&ctx->ctx, inputData, inputDataLength, outputData, &outLength) != 0) {
             return false;
+        }
+
+        if (flags & CIPHER_FLAG_FINISH) {
+            size_t finishLength;
+
+            if (mbedtls_cipher_finish(&ctx->ctx, &outputData[outLength], &finishLength) != 0) {
+                return false;
+            }
+
+            outLength += finishLength;
         }
     }
 
     *outputDataLength = outLength;
     return true;
 #else
-    bool ret = false;
-    const EVP_CIPHER* cipher;
-
-    switch (algorithm) {
-    case ALGORITHM_AES_CBC:
-        LC_ASSERT(keyLength == 16);
-        LC_ASSERT(tag == NULL);
-        LC_ASSERT(tagLength == 0);
-        cipher = EVP_aes_128_cbc();
-        break;
-    case ALGORITHM_AES_GCM:
-        LC_ASSERT(keyLength == 16);
-        LC_ASSERT(tag != NULL);
-        LC_ASSERT(tagLength > 0);
-        cipher = EVP_aes_128_gcm();
-        break;
-    default:
-        LC_ASSERT(false);
-        return false;
-    }
+    LC_ASSERT(keyLength == 16);
 
     if (algorithm == ALGORITHM_AES_GCM) {
-        if (EVP_DecryptInit_ex(ctx->ctx, cipher, NULL, NULL, NULL) != 1) {
-            goto cleanup;
-        }
+        LC_ASSERT(tag != NULL);
+        LC_ASSERT(tagLength > 0);
 
-        if (EVP_CIPHER_CTX_ctrl(ctx->ctx, EVP_CTRL_GCM_SET_IVLEN, ivLength, NULL) != 1) {
-            goto cleanup;
-        }
+        if (!ctx->initialized || (flags & CIPHER_FLAG_RESET_IV)) {
+            // Perform a full initialization. This codepath also allows
+            // us to change the IV length if required.
+            if (EVP_DecryptInit_ex(ctx->ctx, EVP_aes_128_gcm(), NULL, NULL, NULL) != 1) {
+                return false;
+            }
 
-        if (EVP_DecryptInit_ex(ctx->ctx, NULL, NULL, key, iv) != 1) {
-            goto cleanup;
-        }
-    }
-    else {
-        if (!ctx->initialized) {
-            if (EVP_DecryptInit_ex(ctx->ctx, cipher, NULL, key, iv) != 1) {
-                goto cleanup;
+            if (EVP_CIPHER_CTX_ctrl(ctx->ctx, EVP_CTRL_GCM_SET_IVLEN, ivLength, NULL) != 1) {
+                return false;
+            }
+
+            if (EVP_DecryptInit_ex(ctx->ctx, NULL, NULL, key, iv) != 1) {
+                return false;
             }
 
             ctx->initialized = true;
         }
+        else {
+            // Calling with cipher == NULL results in a parameter change
+            // without requiring a reallocation of the internal cipher ctx.
+            if (EVP_DecryptInit_ex(ctx->ctx, NULL, NULL, NULL, iv) != 1) {
+                return false;
+            }
+        }
+    }
+    else if (algorithm == ALGORITHM_AES_CBC) {
+        LC_ASSERT(tag == NULL);
+        LC_ASSERT(tagLength == 0);
+
+        if (!ctx->initialized) {
+            // Perform a full initialization
+            if (EVP_DecryptInit_ex(ctx->ctx, EVP_aes_128_cbc(), NULL, key, iv) != 1) {
+                return false;
+            }
+
+            ctx->initialized = true;
+        }
+        else if (flags & CIPHER_FLAG_RESET_IV) {
+            // Calling with cipher == NULL results in a parameter change
+            // without requiring a reallocation of the internal cipher ctx.
+            if (EVP_DecryptInit_ex(ctx->ctx, NULL, NULL, NULL, iv) != 1) {
+                return false;
+            }
+        }
+    }
+    else {
+        LC_ASSERT(false);
+        return false;
     }
 
     if (EVP_DecryptUpdate(ctx->ctx, outputData, outputDataLength, inputData, inputDataLength) != 1) {
-        goto cleanup;
+        return false;
     }
 
     if (algorithm == ALGORITHM_AES_GCM) {
@@ -261,24 +336,27 @@ bool PltDecryptMessage(PPLT_CRYPTO_CONTEXT ctx, int algorithm,
 
         // Set the GCM tag before calling EVP_DecryptFinal_ex()
         if (EVP_CIPHER_CTX_ctrl(ctx->ctx, EVP_CTRL_GCM_SET_TAG, tagLength, tag) != 1) {
-            goto cleanup;
+            return false;
         }
 
         // GCM will never have additional plaintext here, but we need to call it to
         // ensure that the GCM authentication tag is correct for this data.
         if (EVP_DecryptFinal_ex(ctx->ctx, outputData, &len) != 1) {
-            goto cleanup;
+            return false;
         }
         LC_ASSERT(len == 0);
     }
+    else if (flags & CIPHER_FLAG_FINISH) {
+        int len;
 
-    ret = true;
+        if (EVP_DecryptFinal_ex(ctx->ctx, &outputData[*outputDataLength], &len) != 1) {
+            return false;
+        }
 
-cleanup:
-    if (algorithm == ALGORITHM_AES_GCM) {
-        EVP_CIPHER_CTX_reset(ctx->ctx);
+        *outputDataLength += len;
     }
-    return ret;
+
+    return true;
 #endif
 }
 
